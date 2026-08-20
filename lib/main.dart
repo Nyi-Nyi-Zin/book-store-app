@@ -1,7 +1,13 @@
 import 'dart:async';
 
 import 'package:file_picker/file_picker.dart';
+
+import 'api_client.dart';
+import 'premium_service.dart';
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:in_app_purchase/in_app_purchase.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() => runApp(const BookApp());
@@ -9,6 +15,7 @@ void main() => runApp(const BookApp());
 class Book {
   const Book({
     required this.id,
+    required this.backendId,
     required this.titleMy,
     required this.titleEn,
     required this.author,
@@ -16,7 +23,22 @@ class Book {
     required this.color,
   });
   final String id, titleMy, titleEn, author, description;
+  final int backendId;
   final Color color;
+
+  factory Book.fromApi(Map<String, dynamic> json, Color color) {
+    final rawId = json['id'];
+    return Book(
+      id: json['slug']?.toString() ?? 'book-$rawId',
+      backendId: rawId is int ? rawId : int.tryParse('$rawId') ?? 0,
+      titleMy: json['titleMy']?.toString() ?? 'မြန်မာစာအုပ်',
+      titleEn: json['titleEn']?.toString() ?? 'Untitled book',
+      author: json['author']?.toString() ?? 'Unknown author',
+      description: json['description']?.toString() ?? '',
+      color: color,
+    );
+  }
+
   String title(Locale locale) =>
       locale.languageCode == 'my' ? titleMy : titleEn;
 }
@@ -24,7 +46,9 @@ class Book {
 class ConversionJob {
   ConversionJob(this.filename);
   final String filename;
+  String? remoteId;
   String status = 'Queued';
+  String? error;
 }
 
 class AppState extends ChangeNotifier {
@@ -33,11 +57,21 @@ class AppState extends ChangeNotifier {
   bool isPremium = false, isAdmin = false, isSignedIn = false;
   bool _localeChanged = false, _themeChanged = false;
   int tabIndex = 0;
+  bool catalogLoading = false;
+  String? catalogError;
   final jobs = <ConversionJob>[];
   final readingProgress = <String, int>{};
-  final books = const [
+  final readingBookmarks = <String, Set<int>>{};
+  final bookmarkIds = <String, Map<int, String>>{};
+  final ApiClient api = ApiClient();
+  final PremiumPurchaseService purchaseService = PremiumPurchaseService();
+  List<ProductDetails> premiumProducts = [];
+  String? userName, userEmail, sessionError;
+  bool sessionLoading = false, purchaseLoading = false;
+  final books = <Book>[
     Book(
       id: 'midnight-river',
+      backendId: 1,
       titleMy: 'ညသန်းခေါင်က မြစ်',
       titleEn: 'The Midnight River',
       author: 'Aye Thiri',
@@ -46,6 +80,7 @@ class AppState extends ChangeNotifier {
     ),
     Book(
       id: 'rain-letter',
+      backendId: 2,
       titleMy: 'မိုးရေစက်စာ',
       titleEn: 'Letters in the Rain',
       author: 'Min Thu',
@@ -54,6 +89,7 @@ class AppState extends ChangeNotifier {
     ),
     Book(
       id: 'last-lantern',
+      backendId: 3,
       titleMy: 'နောက်ဆုံးမီးအိမ်',
       titleEn: 'The Last Lantern',
       author: 'Su Myat',
@@ -65,6 +101,9 @@ class AppState extends ChangeNotifier {
 
   AppState() {
     _load();
+    _restoreSession();
+    loadCatalog();
+    initializePurchases();
   }
   Future<void> _load() async {
     final p = await SharedPreferences.getInstance();
@@ -78,6 +117,170 @@ class AppState extends ChangeNotifier {
       );
     }
     notifyListeners();
+  }
+
+  Future<void> loadCatalog() async {
+    catalogLoading = true;
+    notifyListeners();
+    try {
+      final body = await api.catalog().timeout(const Duration(seconds: 3));
+      final remote = (body['books'] as List?)
+          ?.whereType<Map>()
+          .map((json) => json.cast<String, dynamic>())
+          .toList();
+      if (remote != null && remote.isNotEmpty) {
+        const colors = [
+          Color(0xff6d5dfc),
+          Color(0xffd46b4c),
+          Color(0xff238b8b),
+        ];
+        books
+          ..clear()
+          ..addAll(
+            List.generate(
+              remote.length,
+              (index) =>
+                  Book.fromApi(remote[index], colors[index % colors.length]),
+            ),
+          );
+      }
+      catalogError = null;
+    } catch (error) {
+      catalogError = error.toString();
+    } finally {
+      catalogLoading = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> initializePurchases() async {
+    try {
+      if (!await purchaseService.isAvailable()) return;
+      premiumProducts = await purchaseService.loadProducts();
+      purchaseService.listen(onPurchase: _handlePurchase);
+      notifyListeners();
+    } catch (error) {
+      sessionError = error.toString();
+      notifyListeners();
+    }
+  }
+
+  Future<void> _handlePurchase(PurchaseDetails purchase) async {
+    if (purchase.status == PurchaseStatus.pending) {
+      purchaseLoading = true;
+      notifyListeners();
+      return;
+    }
+    if (purchase.status == PurchaseStatus.error) {
+      purchaseLoading = false;
+      sessionError = purchase.error?.message ?? 'Purchase failed';
+      notifyListeners();
+      return;
+    }
+    if (purchase.status == PurchaseStatus.purchased ||
+        purchase.status == PurchaseStatus.restored) {
+      if (!isSignedIn || !api.hasSession) {
+        sessionError = 'Sign in is required before verifying a purchase';
+      } else {
+        try {
+          final platform = defaultTargetPlatform == TargetPlatform.iOS
+              ? 'ios'
+              : 'android';
+          final verified = await api.verifyPurchase(
+            platform: platform,
+            productId: purchase.productID,
+            purchaseToken: purchase.verificationData.serverVerificationData,
+          );
+          isPremium =
+              verified['status'] == 'active' || verified['entitlement'] != null;
+          sessionError = null;
+        } catch (error) {
+          sessionError = error.toString();
+        }
+      }
+    }
+    purchaseLoading = false;
+    notifyListeners();
+  }
+
+  Future<void> buyPremium(ProductDetails product) async {
+    if (!isSignedIn) {
+      sessionError = 'Sign in is required before purchasing Premium';
+      notifyListeners();
+      return;
+    }
+    purchaseLoading = true;
+    notifyListeners();
+    try {
+      await purchaseService.start(product);
+    } catch (error) {
+      purchaseLoading = false;
+      sessionError = error.toString();
+      notifyListeners();
+    }
+  }
+
+  Future<void> restorePremium() async {
+    purchaseLoading = true;
+    sessionError = null;
+    notifyListeners();
+    try {
+      await purchaseService.restore();
+    } catch (error) {
+      purchaseLoading = false;
+      sessionError = error.toString();
+      notifyListeners();
+    }
+  }
+
+  Future<void> _restoreSession() async {
+    // Tokens intentionally remain memory-only until a platform secure-storage
+    // implementation is selected for the target release configuration.
+    api.clearSession();
+  }
+
+  Future<bool> loginDemo({required bool admin}) async {
+    sessionLoading = true;
+    sessionError = null;
+    notifyListeners();
+    try {
+      final body = await api.demoAuth(
+        role: admin ? 'admin' : 'user',
+        name: admin ? 'Admin Account' : 'Reader Account',
+      );
+      final token = body['token']?.toString();
+      if (token == null || token.isEmpty) {
+        throw StateError('Missing session token');
+      }
+      api.setToken(token);
+      final user = (body['user'] as Map?)?.cast<String, dynamic>();
+      isSignedIn = true;
+      isAdmin = user?['role'] == 'admin';
+      userName = user?['name']?.toString();
+      userEmail = user?['email']?.toString();
+      return true;
+    } catch (error) {
+      sessionError = error.toString();
+      return false;
+    } finally {
+      sessionLoading = false;
+      notifyListeners();
+    }
+  }
+
+  Future<bool> activateDemoPremium() async {
+    if (!isSignedIn || !api.hasSession) return false;
+    try {
+      final body = await api.activateDemoPremium();
+      isPremium = body['status'] == 'active';
+      sessionError = null;
+      notifyListeners();
+      return isPremium;
+    } catch (error) {
+      sessionError = error.toString();
+      notifyListeners();
+      return false;
+    }
   }
 
   Future<void> toggleLocale() async {
@@ -110,7 +313,11 @@ class AppState extends ChangeNotifier {
     isSignedIn = false;
     isAdmin = false;
     isPremium = false;
+    userName = null;
+    userEmail = null;
+    sessionError = null;
     tabIndex = 0;
+    api.clearSession();
     notifyListeners();
   }
 
@@ -130,6 +337,85 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<bool> canReadFull(Book book) async {
+    if (!isSignedIn || !api.hasSession) return false;
+    try {
+      final body = await api.fullBookAccess(book.backendId);
+      return body['access'] == 'full';
+    } catch (error) {
+      sessionError = error.toString();
+      notifyListeners();
+      return false;
+    }
+  }
+
+  Future<void> syncProgress(Book book, int page, int totalPages) async {
+    setProgress(book.id, page);
+    if (!isSignedIn || !api.hasSession) return;
+    try {
+      await api.saveProgress(
+        bookId: book.backendId,
+        pageNumber: page,
+        percent: ((page / totalPages) * 100).round().clamp(0, 100),
+      );
+    } catch (error) {
+      sessionError = error.toString();
+      notifyListeners();
+    }
+  }
+
+  Future<void> loadBookmarks(Book book) async {
+    if (!isSignedIn || !api.hasSession) return;
+    try {
+      final body = await api.getBookmarks(book.backendId);
+      final items =
+          (body['bookmarks'] as List?)?.whereType<Map>().toList() ?? [];
+      readingBookmarks[book.id] = items
+          .map((item) => (item['pageNumber'] as num).toInt())
+          .toSet();
+      bookmarkIds[book.id] = {
+        for (final item in items)
+          (item['pageNumber'] as num).toInt(): item['id'].toString(),
+      };
+      notifyListeners();
+    } catch (error) {
+      sessionError = error.toString();
+      notifyListeners();
+    }
+  }
+
+  Future<bool> toggleBookmark(Book book, int page) async {
+    final pages = readingBookmarks.putIfAbsent(book.id, () => <int>{});
+    final ids = bookmarkIds.putIfAbsent(book.id, () => <int, String>{});
+    try {
+      if (pages.contains(page)) {
+        final id = ids[page];
+        if (id != null && isSignedIn && api.hasSession) {
+          await api.deleteBookmark(bookId: book.backendId, bookmarkId: id);
+        }
+        pages.remove(page);
+        ids.remove(page);
+      } else {
+        pages.add(page);
+        if (isSignedIn && api.hasSession) {
+          final body = await api.addBookmark(
+            bookId: book.backendId,
+            pageNumber: page,
+          );
+          final bookmark = (body['bookmark'] as Map?)?.cast<String, dynamic>();
+          final id = bookmark?['id']?.toString();
+          if (id != null) ids[page] = id;
+        }
+      }
+      notifyListeners();
+      return true;
+    } catch (error) {
+      sessionError = error.toString();
+      notifyListeners();
+      return false;
+    }
+  }
+
   Future<void> pickFile() async {
     final files = await FilePicker.pickFiles(
       type: FileType.custom,
@@ -137,9 +423,30 @@ class AppState extends ChangeNotifier {
     );
     if (files.isEmpty) return;
     final file = files.first;
+    final bytes = await file.readAsBytes();
     final job = ConversionJob(file.name);
     jobs.insert(0, job);
     notifyListeners();
+
+    if (isAdmin && api.hasSession && bytes.isNotEmpty) {
+      try {
+        final body = await api.uploadBook(
+          bookId: books.first.backendId,
+          filename: file.name,
+          bytes: bytes,
+        );
+        final remote = (body['job'] as Map?)?.cast<String, dynamic>();
+        job.remoteId = remote?['id']?.toString();
+        job.status = _jobLabel(remote?['status']?.toString() ?? 'queued');
+      } catch (error) {
+        job.status = 'Failed';
+        job.error = error.toString();
+        sessionError = error.toString();
+      }
+      notifyListeners();
+      return;
+    }
+
     await Future<void>.delayed(const Duration(milliseconds: 700));
     job.status = file.name.toLowerCase().endsWith('.epub')
         ? 'Converting'
@@ -149,6 +456,52 @@ class AppState extends ChangeNotifier {
       await Future<void>.delayed(const Duration(milliseconds: 900));
       job.status = 'Completed';
       notifyListeners();
+    }
+  }
+
+  String _jobLabel(String value) => switch (value) {
+    'processing' => 'Processing',
+    'completed' => 'Completed',
+    'failed' => 'Failed',
+    _ => 'Queued',
+  };
+
+  Future<void> refreshAdminJobs() async {
+    if (!isAdmin || !api.hasSession) return;
+    try {
+      final body = await api.adminJobs();
+      final remote = (body['jobs'] as List?)?.whereType<Map>().toList() ?? [];
+      jobs
+        ..clear()
+        ..addAll(
+          remote.map((item) {
+            final job = ConversionJob(
+              item['sourceFilename']?.toString() ?? 'Book job',
+            );
+            job.remoteId = item['id']?.toString();
+            job.status = _jobLabel(item['status']?.toString() ?? 'queued');
+            job.error = item['errorMessage']?.toString();
+            return job;
+          }),
+        );
+      notifyListeners();
+    } catch (error) {
+      sessionError = error.toString();
+      notifyListeners();
+    }
+  }
+
+  Future<bool> publishBook(Book book) async {
+    if (!isAdmin || !api.hasSession) return false;
+    try {
+      await api.publishBook(book.backendId);
+      sessionError = null;
+      notifyListeners();
+      return true;
+    } catch (error) {
+      sessionError = error.toString();
+      notifyListeners();
+      return false;
     }
   }
 }
@@ -163,6 +516,7 @@ class _BookAppState extends State<BookApp> {
   final state = AppState();
   @override
   void dispose() {
+    state.purchaseService.dispose();
     state.dispose();
     super.dispose();
   }
@@ -431,6 +785,27 @@ class _CatalogState extends State<CatalogPage> {
       title: t(widget.state, 'စာအုပ်များ', 'Library'),
       child: Column(
         children: [
+          if (widget.state.catalogLoading) const LinearProgressIndicator(),
+          if (widget.state.catalogError != null)
+            Card(
+              child: ListTile(
+                leading: const Icon(Icons.cloud_off),
+                title: Text(
+                  t(widget.state, 'အင်တာနက်မရသေးပါ', 'Offline fallback'),
+                ),
+                subtitle: Text(
+                  t(
+                    widget.state,
+                    'သိမ်းထားသောစာအုပ်များကို ပြသနေပါသည်။',
+                    'Showing the locally cached catalog.',
+                  ),
+                ),
+                trailing: IconButton(
+                  icon: const Icon(Icons.refresh),
+                  onPressed: widget.state.loadCatalog,
+                ),
+              ),
+            ),
           TextField(
             onChanged: (v) => setState(() => query = v),
             decoration: InputDecoration(
@@ -609,8 +984,15 @@ class DetailPage extends StatelessWidget {
                 const SizedBox(width: 12),
                 Expanded(
                   child: FilledButton.icon(
-                    onPressed: () {
-                      if (state.isPremium) {
+                    onPressed: () async {
+                      if (!state.isSignedIn) {
+                        state.setTab(3);
+                        Navigator.pop(context);
+                        return;
+                      }
+                      final allowed = await state.canReadFull(book);
+                      if (!context.mounted) return;
+                      if (allowed) {
                         Navigator.push(
                           context,
                           MaterialPageRoute(
@@ -682,11 +1064,16 @@ class _ReaderState extends State<ReaderPage> {
   void initState() {
     super.initState();
     page = widget.state.readingProgress[widget.book.id] ?? 1;
+    widget.state.loadBookmarks(widget.book);
   }
 
   void _goTo(int nextPage) {
     setState(() => page = nextPage);
-    widget.state.setProgress(widget.book.id, page);
+    widget.state.syncProgress(
+      widget.book,
+      page,
+      widget.preview ? 2 : pages.length,
+    );
   }
 
   final pages = const [
@@ -701,15 +1088,39 @@ class _ReaderState extends State<ReaderPage> {
       appBar: AppBar(
         title: Text(widget.book.title(widget.state.locale)),
         actions: [
-          IconButton(
-            onPressed: () => ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text(
-                  t(widget.state, 'Bookmark သိမ်းပြီးပါပြီ', 'Bookmark saved'),
-                ),
-              ),
-            ),
-            icon: const Icon(Icons.bookmark_border),
+          AnimatedBuilder(
+            animation: widget.state,
+            builder: (context, _) {
+              final bookmarked =
+                  widget.state.readingBookmarks[widget.book.id]?.contains(
+                    page,
+                  ) ==
+                  true;
+              return IconButton(
+                onPressed: () async {
+                  await widget.state.toggleBookmark(widget.book, page);
+                  if (!context.mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        bookmarked
+                            ? t(
+                                widget.state,
+                                'Bookmark ဖယ်ရှားပြီးပါပြီ',
+                                'Bookmark removed',
+                              )
+                            : t(
+                                widget.state,
+                                'Bookmark သိမ်းပြီးပါပြီ',
+                                'Bookmark saved',
+                              ),
+                      ),
+                    ),
+                  );
+                },
+                icon: Icon(bookmarked ? Icons.bookmark : Icons.bookmark_border),
+              );
+            },
           ),
         ],
       ),
@@ -850,7 +1261,35 @@ class PremiumPage extends StatelessWidget {
             t(state, 'Device များအကြား Sync', 'Sync across devices'),
           ),
           const SizedBox(height: 18),
-          if (!state.isPremium)
+          if (!state.isPremium && state.premiumProducts.isNotEmpty) ...[
+            Text(
+              t(state, 'အစီအစဉ်ရွေးချယ်ပါ', 'Choose a plan'),
+              style: Theme.of(context).textTheme.titleMedium
+                  ?.copyWith(fontWeight: FontWeight.w800),
+            ),
+            const SizedBox(height: 8),
+            ...state.premiumProducts.map(
+              (product) => Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: SizedBox(
+                  width: double.infinity,
+                  child: FilledButton(
+                    onPressed: state.purchaseLoading
+                        ? null
+                        : () => state.buyPremium(product),
+                    child: Text('${product.title} · ${product.price}'),
+                  ),
+                ),
+              ),
+            ),
+            TextButton.icon(
+              onPressed: state.purchaseLoading ? null : state.restorePremium,
+              icon: const Icon(Icons.restore),
+              label: Text(t(state, 'ဝယ်ယူမှု ပြန်ယူရန်', 'Restore purchases')),
+            ),
+            const SizedBox(height: 8),
+          ],
+          if (!state.isPremium && state.premiumProducts.isEmpty)
             SizedBox(
               width: double.infinity,
               child: FilledButton(
@@ -861,14 +1300,14 @@ class PremiumPage extends StatelessWidget {
                       t(
                         state,
                         'Premium စမ်းသပ်ဝယ်ယူမှု',
-                        'Premium test purchase',
+                        'Premium demo fallback',
                       ),
                     ),
                     content: Text(
                       t(
                         state,
-                        'Production တွင် App Store/Google Play billing နှင့် backend verification ကို ချိတ်ဆက်ပါမည်။ ယခု demo တွင် entitlement flow ကို စမ်းသပ်နိုင်ပါသည်။',
-                        'Production will connect App Store/Google Play billing with server verification. This demo tests the entitlement flow.',
+                        'Store product မသတ်မှတ်ရသေးပါက ဒီ demo fallback ဖြင့် entitlement flow ကို စမ်းနိုင်ပါသည်။ Production တွင် native billing နှင့် backend verification ကို အသုံးပြုရပါမည်။',
+                        'When store products are not configured, use this demo fallback for local testing. Production must use native billing and backend verification.',
                       ),
                     ),
                     actions: [
@@ -877,9 +1316,24 @@ class PremiumPage extends StatelessWidget {
                         child: Text(t(state, 'မလုပ်တော့ပါ', 'Cancel')),
                       ),
                       FilledButton(
-                        onPressed: () {
-                          state.unlockDemo();
+                        onPressed: () async {
+                          final ok = await state.activateDemoPremium();
+                          if (!context.mounted) return;
                           Navigator.pop(context);
+                          if (!ok) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text(
+                                  state.sessionError ??
+                                      t(
+                                        state,
+                                        'အရင်ဆုံး အကောင့်ဝင်ပါ',
+                                        'Sign in first',
+                                      ),
+                                ),
+                              ),
+                            );
+                          }
                         },
                         child: Text(t(state, 'စမ်းသပ်ဖွင့်ရန်', 'Unlock demo')),
                       ),
@@ -961,6 +1415,18 @@ class ProfilePage extends StatelessWidget {
             ),
           ),
         ),
+        if (state.sessionError != null)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Text(
+              t(
+                state,
+                'ချိတ်ဆက်မှု မအောင်မြင်ပါ။ ထပ်မံကြိုးစားပါ။',
+                'Connection failed. Please try again.',
+              ),
+              style: TextStyle(color: Theme.of(context).colorScheme.error),
+            ),
+          ),
         ListTile(
           leading: const Icon(Icons.language),
           title: Text(t(state, 'ဘာသာစကား', 'Language')),
@@ -996,24 +1462,30 @@ class ProfilePage extends StatelessWidget {
     content: Text(
       t(
         state,
-        'Production backend တွင် OAuth login ချိတ်ဆက်မည်။ Demo တွင် role flow ကို စမ်းနိုင်ပါသည်။',
-        'OAuth login will connect to the production backend. Use demo roles to test the flows.',
+        'Backend session ကို စစ်ဆေးပြီး Reader/Admin role အလိုက် ဝင်ရောက်ပါမည်။ Local backend မချိတ်ထားသေးရင် demo session သုံးနိုင်ပါသည်။',
+        'The app will request a backend session and route by Reader/Admin role. A demo session is available when the local backend is not configured.',
       ),
     ),
     actions: [
       TextButton(
-        onPressed: () {
-          state.signIn();
-          Navigator.pop(context);
-        },
-        child: Text(t(state, 'Reader', 'Reader demo')),
+        onPressed: state.sessionLoading
+            ? null
+            : () async {
+                final ok = await state.loginDemo(admin: false);
+                if (!context.mounted) return;
+                if (ok) Navigator.pop(context);
+              },
+        child: Text(t(state, 'Reader ဝင်ရန်', 'Continue as Reader')),
       ),
       FilledButton(
-        onPressed: () {
-          state.signIn(admin: true);
-          Navigator.pop(context);
-        },
-        child: Text(t(state, 'Admin', 'Admin demo')),
+        onPressed: state.sessionLoading
+            ? null
+            : () async {
+                final ok = await state.loginDemo(admin: true);
+                if (!context.mounted) return;
+                if (ok) Navigator.pop(context);
+              },
+        child: Text(t(state, 'Admin ဝင်ရန်', 'Continue as Admin')),
       ),
     ],
   );
@@ -1073,6 +1545,48 @@ class AdminPage extends StatelessWidget {
             label: Text(t(state, 'ဖိုင်ရွေးရန်', 'Choose file')),
           ),
         ),
+        if (state.api.hasSession) ...[
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: state.refreshAdminJobs,
+                  icon: const Icon(Icons.refresh),
+                  label: Text(t(state, 'Jobs ပြန်စစ်ရန်', 'Refresh jobs')),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: () async {
+                    final ok = await state.publishBook(state.books.first);
+                    if (!context.mounted) return;
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text(
+                          ok
+                              ? t(
+                                  state,
+                                  'စာအုပ် Publish ပြီးပါပြီ',
+                                  'Book published',
+                                )
+                              : t(
+                                  state,
+                                  'PDF ပြီးမှ Publish လုပ်ပါ',
+                                  'Upload a PDF before publishing',
+                                ),
+                        ),
+                      ),
+                    );
+                  },
+                  icon: const Icon(Icons.publish),
+                  label: Text(t(state, 'Publish', 'Publish')),
+                ),
+              ),
+            ],
+          ),
+        ],
         const SizedBox(height: 24),
         if (state.jobs.isNotEmpty) ...[
           Text(
@@ -1087,9 +1601,13 @@ class AdminPage extends StatelessWidget {
                 leading: Icon(
                   j.status == 'Completed' || j.status == 'Ready'
                       ? Icons.check_circle
+                      : j.status == 'Failed'
+                      ? Icons.error
                       : Icons.sync,
                   color: j.status == 'Completed' || j.status == 'Ready'
                       ? Colors.green
+                      : j.status == 'Failed'
+                      ? Theme.of(context).colorScheme.error
                       : Theme.of(context).colorScheme.primary,
                 ),
                 title: Text(j.filename),

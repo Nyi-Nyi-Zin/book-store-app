@@ -14,6 +14,12 @@ class ApiClient {
   final String baseUrl;
   String? token;
 
+  bool get hasSession => token != null && token!.isNotEmpty;
+
+  void setToken(String? value) => token = value;
+
+  void clearSession() => token = null;
+
   Map<String, String> get _headers => {
     'Accept': 'application/json',
     'Content-Type': 'application/json',
@@ -71,6 +77,33 @@ class ApiClient {
   Future<Map<String, dynamic>> getProgress(int bookId) async =>
       _get('/api/reader/progress/$bookId');
 
+  Future<Map<String, dynamic>> getBookmarks(int bookId) async =>
+      _get('/api/reader/bookmarks/$bookId');
+
+  Future<Map<String, dynamic>> addBookmark({
+    required int bookId,
+    required int pageNumber,
+    String? note,
+  }) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/api/reader/bookmarks/$bookId'),
+      headers: _headers,
+      body: jsonEncode({'pageNumber': pageNumber, 'note': note}),
+    );
+    return _decode(response);
+  }
+
+  Future<void> deleteBookmark({
+    required int bookId,
+    required String bookmarkId,
+  }) async {
+    final response = await http.delete(
+      Uri.parse('$baseUrl/api/reader/bookmarks/$bookId/$bookmarkId'),
+      headers: _headers,
+    );
+    if (response.statusCode != 204) _decode(response);
+  }
+
   Future<Map<String, dynamic>> saveProgress({
     required int bookId,
     required int pageNumber,
@@ -83,6 +116,25 @@ class ApiClient {
     );
     return _decode(response);
   }
+
+  Future<Map<String, dynamic>> publishBook(int bookId) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/api/admin/books/$bookId/publish'),
+      headers: _headers,
+    );
+    return _decode(response);
+  }
+
+  Future<Map<String, dynamic>> unpublishBook(int bookId) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/api/admin/books/$bookId/unpublish'),
+      headers: _headers,
+    );
+    return _decode(response);
+  }
+
+  Future<Map<String, dynamic>> adminJobs() async => _get('/api/admin/jobs');
+  Future<Map<String, dynamic>> adminAudit() async => _get('/api/admin/audit');
 
   Future<Map<String, dynamic>> uploadBook({
     required int bookId,
