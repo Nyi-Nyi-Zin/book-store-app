@@ -1,6 +1,6 @@
 # iOS Release Guide
 
-The Flutter project already contains the iOS runner under `ios/` and is ready to open on macOS with Xcode. The current bundle identifier is `com.manus.flutterBookApp`-style project configuration generated from the app scaffold; set the final identifier in Xcode before distribution, for example `com.yourcompany.bookapp`.
+The Flutter project already contains the iOS runner under `ios/` and is ready to open on macOS with Xcode. The current placeholder bundle identifier is `com.manus.flutterBookApp`; replace it in Xcode with an identifier owned by your Apple Developer account, for example `com.yourcompany.bookapp`, before distribution.
 
 ## Requirements
 
@@ -18,7 +18,7 @@ cd ..
 open ios/Runner.xcworkspace
 ```
 
-In Xcode, select the `Runner` target, choose the final **Bundle Identifier**, select the Apple Developer **Team**, enable **Automatically manage signing** for the first build, and verify the minimum iOS deployment target and app display name. Add the App Store Connect in-app purchase products using the IDs defined in `lib/premium_service.dart`.
+In Xcode, select the `Runner` target, set **Bundle Identifier** to an identifier owned by your Apple Developer account, select the Apple Developer **Team**, enable **Automatically manage signing** for the first build, and verify the minimum iOS deployment target (currently 15.0) and app display name. Add the App Store Connect in-app purchase products using the IDs defined in `lib/premium_service.dart`.
 
 ## Test build
 
