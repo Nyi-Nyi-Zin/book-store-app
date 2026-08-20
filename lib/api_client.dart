@@ -39,6 +39,40 @@ class ApiClient {
   }
 
   Future<Map<String, dynamic>> me() async => _get('/api/auth/me');
+
+  Future<Map<String, dynamic>> subscriptionStatus() async =>
+      _get('/api/account/subscription');
+
+  Future<Map<String, dynamic>> requestAccountDeletion() async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/api/account/delete-request'),
+      headers: _headers,
+    );
+    return _decode(response);
+  }
+
+  Future<Map<String, dynamic>> requestSignUp({
+    required String name,
+    required String email,
+    required String password,
+  }) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/api/auth/signup'),
+      headers: _headers,
+      body: jsonEncode({'name': name, 'email': email, 'password': password}),
+    );
+    return _decode(response);
+  }
+
+  Future<Map<String, dynamic>> requestPasswordReset(String email) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/api/auth/password-reset'),
+      headers: _headers,
+      body: jsonEncode({'email': email}),
+    );
+    return _decode(response);
+  }
+
   Future<Map<String, dynamic>> catalog() async => _get('/api/books');
 
   Future<Map<String, dynamic>> fullBookAccess(int bookId) async {

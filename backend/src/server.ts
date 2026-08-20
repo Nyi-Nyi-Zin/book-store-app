@@ -47,6 +47,7 @@ const entitlements = new Map<string, { status: 'active' | 'expired' | 'revoked';
 const progress = new Map<string, { pageNumber: number; percent: number }>();
 const bookmarks = new Map<string, Array<{ id: string; pageNumber: number; note: string | null }>>();
 const auditLogs: Array<{ id: string; adminUserId: number; action: string; entityType: string; entityId: string; createdAt: string }> = [];
+const accountDeletionRequests: Array<{ id: string; userId: number; status: 'received'; createdAt: string }> = [];
 const conversionJobs = new Map<string, ConversionJob>();
 let nextUserId = 1;
 let nextBookId = 4;
@@ -135,6 +136,27 @@ app.post('/api/auth/demo', async (req, res) => {
 app.get('/api/auth/me', auth, (req: AuthRequest, res) => {
   const isPremium = hasPremium(req.user!.id);
   res.json({ user: req.user, isPremium, entitlement: entitlements.get(String(req.user!.id)) ?? null });
+});
+
+app.post('/api/auth/signup', (req, res) => {
+  const input = z.object({ name: z.string().min(1).max(80), email: z.string().email(), password: z.string().min(8) }).parse(req.body ?? {});
+  res.status(501).json({ error: 'Sign-up is delegated to the configured authentication provider', provider: authProvider, email: input.email });
+});
+
+app.post('/api/auth/password-reset', (req, res) => {
+  const input = z.object({ email: z.string().email() }).parse(req.body ?? {});
+  res.status(501).json({ error: 'Password reset is delegated to the configured authentication provider', provider: authProvider, email: input.email });
+});
+
+app.get('/api/account/subscription', auth, (req: AuthRequest, res) => {
+  const entitlement = entitlements.get(String(req.user!.id)) ?? null;
+  res.json({ isPremium: hasPremium(req.user!.id), entitlement });
+});
+
+app.post('/api/account/delete-request', auth, (req: AuthRequest, res) => {
+  const request = { id: `delete-${Date.now()}`, userId: req.user!.id, status: 'received' as const, createdAt: new Date().toISOString() };
+  accountDeletionRequests.unshift(request);
+  res.status(202).json({ requestId: request.id, status: request.status, message: 'Account deletion request received' });
 });
 
 app.get('/api/books', (_req, res) => res.json({ books }));

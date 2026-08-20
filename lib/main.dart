@@ -70,7 +70,10 @@ class AppState extends ChangeNotifier {
   final PremiumPurchaseService purchaseService = PremiumPurchaseService();
   List<ProductDetails> premiumProducts = [];
   String? userName, userEmail, sessionError;
-  bool sessionLoading = false, purchaseLoading = false;
+  Map<String, dynamic>? subscription;
+  bool sessionLoading = false,
+      purchaseLoading = false,
+      accountActionLoading = false;
   final books = <Book>[
     Book(
       id: 'midnight-river',
@@ -261,6 +264,7 @@ class AppState extends ChangeNotifier {
       isAdmin = user?['role'] == 'admin';
       userName = user?['name']?.toString();
       userEmail = user?['email']?.toString();
+      await loadSubscription();
       return true;
     } catch (error) {
       sessionError = error.toString();
@@ -268,6 +272,47 @@ class AppState extends ChangeNotifier {
     } finally {
       sessionLoading = false;
       notifyListeners();
+    }
+  }
+
+  Future<void> loadSubscription() async {
+    if (!isSignedIn || !api.hasSession) return;
+    try {
+      subscription = await api.subscriptionStatus();
+      isPremium = subscription?['isPremium'] == true;
+      sessionError = null;
+      notifyListeners();
+    } catch (error) {
+      sessionError = error.toString();
+      notifyListeners();
+    }
+  }
+
+  Future<bool> requestAccountDeletion() async {
+    if (!isSignedIn || !api.hasSession) return false;
+    accountActionLoading = true;
+    sessionError = null;
+    notifyListeners();
+    try {
+      await api.requestAccountDeletion();
+      return true;
+    } catch (error) {
+      sessionError = error.toString();
+      return false;
+    } finally {
+      accountActionLoading = false;
+      notifyListeners();
+    }
+  }
+
+  Future<String?> requestPasswordReset(String email) async {
+    try {
+      await api.requestPasswordReset(email);
+      return null;
+    } on ApiException catch (error) {
+      return error.message;
+    } catch (error) {
+      return error.toString();
     }
   }
 
@@ -318,6 +363,7 @@ class AppState extends ChangeNotifier {
     isPremium = false;
     userName = null;
     userEmail = null;
+    subscription = null;
     sessionError = null;
     tabIndex = 0;
     api.clearSession();
@@ -1541,6 +1587,154 @@ class ProfilePage extends StatelessWidget {
               style: TextStyle(color: Theme.of(context).colorScheme.error),
             ),
           ),
+        if (state.isSignedIn) ...[
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.account_circle_outlined),
+              title: Text(
+                state.userName ?? t(state, 'အသုံးပြုသူ', 'Account holder'),
+              ),
+              subtitle: Text(
+                state.userEmail ??
+                    t(state, 'Email မသတ်မှတ်ရသေးပါ', 'Email not available'),
+              ),
+            ),
+          ),
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.workspace_premium_outlined),
+              title: Text(
+                t(state, 'Subscription status', 'Subscription status'),
+              ),
+              subtitle: Text(
+                state.isPremium
+                    ? t(state, 'Premium active', 'Premium active')
+                    : t(state, 'Preview access only', 'Preview access only'),
+              ),
+              trailing: IconButton(
+                onPressed: state.loadSubscription,
+                icon: const Icon(Icons.refresh),
+              ),
+            ),
+          ),
+          ListTile(
+            leading: Icon(
+              Icons.delete_forever_outlined,
+              color: Theme.of(context).colorScheme.error,
+            ),
+            title: Text(
+              t(
+                state,
+                'အကောင့်ဖျက်ရန် တောင်းဆိုမှု',
+                'Request account deletion',
+              ),
+            ),
+            subtitle: Text(
+              t(
+                state,
+                'Support team သို့ deletion request ပို့မည်။',
+                'Send a deletion request to support.',
+              ),
+            ),
+            onTap: state.accountActionLoading
+                ? null
+                : () => showDialog(
+                    context: context,
+                    builder: (dialogContext) => AlertDialog(
+                      title: Text(
+                        t(state, 'အကောင့်ဖျက်မည်လား', 'Delete account?'),
+                      ),
+                      content: Text(
+                        t(
+                          state,
+                          'ဒီလုပ်ဆောင်ချက်က support သို့ request ပို့ပြီးနောက် ဆက်လက်အတည်ပြုမည်။',
+                          'This sends a request to support for confirmation before deletion.',
+                        ),
+                      ),
+                      actions: [
+                        TextButton(
+                          onPressed: () => Navigator.pop(dialogContext),
+                          child: Text(t(state, 'မလုပ်တော့ပါ', 'Cancel')),
+                        ),
+                        FilledButton(
+                          onPressed: () async {
+                            final ok = await state.requestAccountDeletion();
+                            if (!dialogContext.mounted) return;
+                            Navigator.pop(dialogContext);
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text(
+                                  ok
+                                      ? t(
+                                          state,
+                                          'Request ပို့ပြီးပါပြီ',
+                                          'Request submitted',
+                                        )
+                                      : (state.sessionError ??
+                                            t(
+                                              state,
+                                              'မအောင်မြင်ပါ',
+                                              'Request failed',
+                                            )),
+                                ),
+                              ),
+                            );
+                          },
+                          child: Text(
+                            t(state, 'တောင်းဆိုမည်', 'Submit request'),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+          ),
+        ],
+        ListTile(
+          leading: const Icon(Icons.help_outline),
+          title: Text(t(state, 'အကူအညီနှင့် Support', 'Help and support')),
+          onTap: () => showDialog(
+            context: context,
+            builder: (_) => AlertDialog(
+              title: Text(t(state, 'အကူအညီ', 'Help and support')),
+              content: Text(
+                t(
+                  state,
+                  'စာအုပ်၊ Premium၊ ငွေပေးချေမှု သို့မဟုတ် account ပြဿနာများအတွက် support team သို့ ဆက်သွယ်ပါ။',
+                  'Contact the support team for book, Premium, payment, or account issues.',
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: Text(t(state, 'ပိတ်ရန်', 'Close')),
+                ),
+              ],
+            ),
+          ),
+        ),
+        ListTile(
+          leading: const Icon(Icons.policy_outlined),
+          title: Text(t(state, 'Terms နှင့် Privacy', 'Terms and privacy')),
+          onTap: () => showDialog(
+            context: context,
+            builder: (_) => AlertDialog(
+              title: Text(t(state, 'Terms နှင့် Privacy', 'Terms and privacy')),
+              content: Text(
+                t(
+                  state,
+                  'စာအုပ်ပါအကြောင်းအရာများကို မူပိုင်ခွင့်နှင့် သတ်မှတ်ချက်များအတိုင်း အသုံးပြုရပါမည်။ Privacy policy နှင့် terms ကို production release မတိုင်မီ သင့် domain ဖြင့် အစားထိုးပါ။',
+                  'Use book content according to copyright and service terms. Replace this placeholder with your published privacy policy and terms before production release.',
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: Text(t(state, 'ပိတ်ရန်', 'Close')),
+                ),
+              ],
+            ),
+          ),
+        ),
         ListTile(
           leading: const Icon(Icons.language),
           title: Text(t(state, 'ဘာသာစကား', 'Language')),
@@ -1581,6 +1775,28 @@ class ProfilePage extends StatelessWidget {
       ),
     ),
     actions: [
+      TextButton(
+        onPressed: () => showDialog(
+          context: context,
+          builder: (_) => AlertDialog(
+            title: Text(t(state, 'အကောင့်ဖန်တီးရန်', 'Create account')),
+            content: Text(
+              t(
+                state,
+                'Sign-up ကို သတ်မှတ်ထားသော authentication provider မှ စီမံပါမည်။',
+                'Sign-up is handled by the configured authentication provider.',
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: Text(t(state, 'ပိတ်ရန်', 'Close')),
+              ),
+            ],
+          ),
+        ),
+        child: Text(t(state, 'အကောင့်ဖန်တီးရန်', 'Create account')),
+      ),
       TextButton(
         onPressed: state.sessionLoading
             ? null
