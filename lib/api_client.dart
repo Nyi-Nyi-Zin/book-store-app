@@ -49,6 +49,17 @@ class ApiClient {
     return _decode(response);
   }
 
+  Future<List<int>> downloadProtectedBook(int bookId) async {
+    final response = await http.get(
+      Uri.parse('$baseUrl/api/books/$bookId/file'),
+      headers: _headers,
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      _decode(response);
+    }
+    return response.bodyBytes;
+  }
+
   Future<Map<String, dynamic>> activateDemoPremium() async {
     final response = await http.post(
       Uri.parse('$baseUrl/api/premium/demo-activate'),

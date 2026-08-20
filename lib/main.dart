@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter_pdfview/flutter_pdfview.dart';
 
 import 'api_client.dart';
 import 'premium_service.dart';
@@ -8,6 +10,7 @@ import 'premium_service.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:in_app_purchase/in_app_purchase.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() => runApp(const BookApp());
@@ -347,6 +350,29 @@ class AppState extends ChangeNotifier {
       notifyListeners();
       return false;
     }
+  }
+
+  Future<File?> cachedBookFile(Book book) async {
+    final directory = await getApplicationDocumentsDirectory();
+    final file = File('${directory.path}/book_cache/${book.id}.pdf');
+    if (await file.exists() && await file.length() > 0) return file;
+    return null;
+  }
+
+  Future<File> prepareProtectedPdf(Book book) async {
+    final cached = await cachedBookFile(book);
+    if (cached != null) return cached;
+    if (!await canReadFull(book)) {
+      throw StateError('Premium entitlement required');
+    }
+    final bytes = await api.downloadProtectedBook(book.backendId);
+    if (bytes.isEmpty) throw StateError('The protected PDF is empty');
+    final directory = await getApplicationDocumentsDirectory();
+    final cacheDirectory = Directory('${directory.path}/book_cache');
+    await cacheDirectory.create(recursive: true);
+    final file = File('${cacheDirectory.path}/${book.id}.pdf');
+    await file.writeAsBytes(bytes, flush: true);
+    return file;
   }
 
   Future<void> syncProgress(Book book, int page, int totalPages) async {
@@ -985,27 +1011,40 @@ class DetailPage extends StatelessWidget {
                 Expanded(
                   child: FilledButton.icon(
                     onPressed: () async {
-                      if (!state.isSignedIn) {
-                        state.setTab(3);
-                        Navigator.pop(context);
-                        return;
-                      }
-                      final allowed = await state.canReadFull(book);
-                      if (!context.mounted) return;
-                      if (allowed) {
+                      try {
+                        final file = await state.prepareProtectedPdf(book);
+                        if (!context.mounted) return;
                         Navigator.push(
                           context,
                           MaterialPageRoute(
-                            builder: (_) => ReaderPage(
+                            builder: (_) => PdfReaderPage(
                               book: book,
                               state: state,
-                              preview: false,
+                              file: file,
                             ),
                           ),
                         );
-                      } else {
-                        state.setTab(2);
+                      } catch (_) {
+                        if (!context.mounted) return;
+                        state.setTab(state.isSignedIn ? 2 : 3);
                         Navigator.pop(context);
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: Text(
+                              state.isSignedIn
+                                  ? t(
+                                      state,
+                                      'Premium လိုအပ်ပါသည်',
+                                      'Premium access is required',
+                                    )
+                                  : t(
+                                      state,
+                                      'အရင်ဆုံး အကောင့်ဝင်ပါ',
+                                      'Sign in first',
+                                    ),
+                            ),
+                          ),
+                        );
                       }
                     },
                     icon: Icon(
@@ -1189,6 +1228,81 @@ class _ReaderState extends State<ReaderPage> {
           ],
         ),
       ),
+    );
+  }
+}
+
+class PdfReaderPage extends StatefulWidget {
+  const PdfReaderPage({
+    required this.book,
+    required this.state,
+    required this.file,
+    super.key,
+  });
+  final Book book;
+  final AppState state;
+  final File file;
+
+  @override
+  State<PdfReaderPage> createState() => _PdfReaderState();
+}
+
+class _PdfReaderState extends State<PdfReaderPage> {
+  int? totalPages;
+  int currentPage = 1;
+  String? error;
+
+  @override
+  void initState() {
+    super.initState();
+    currentPage = widget.state.readingProgress[widget.book.id] ?? 1;
+    widget.state.loadBookmarks(widget.book);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bookmarked =
+        widget.state.readingBookmarks[widget.book.id]?.contains(currentPage) ==
+        true;
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.book.title(widget.state.locale)),
+        actions: [
+          IconButton(
+            onPressed: () async {
+              await widget.state.toggleBookmark(widget.book, currentPage);
+              if (mounted) setState(() {});
+            },
+            icon: Icon(bookmarked ? Icons.bookmark : Icons.bookmark_border),
+          ),
+        ],
+      ),
+      body: error != null
+          ? Center(child: Text(error!))
+          : PDFView(
+              filePath: widget.file.path,
+              defaultPage: (currentPage - 1).clamp(0, 100000),
+              enableSwipe: true,
+              swipeHorizontal: false,
+              autoSpacing: true,
+              pageFling: true,
+              onRender: (pages) => setState(() => totalPages = pages),
+              onPageChanged: (page, total) {
+                final nextPage = (page ?? 0) + 1;
+                setState(() {
+                  currentPage = nextPage;
+                  totalPages = total ?? totalPages;
+                });
+                widget.state.syncProgress(
+                  widget.book,
+                  nextPage,
+                  total ?? totalPages ?? nextPage,
+                );
+              },
+              onError: (value) => setState(() => error = value.toString()),
+              onPageError: (page, value) =>
+                  setState(() => error = 'Page $page: $value'),
+            ),
     );
   }
 }

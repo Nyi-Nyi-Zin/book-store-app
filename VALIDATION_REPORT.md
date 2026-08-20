@@ -15,5 +15,8 @@ The current feature-flow pass completed the following checks successfully.
 | Conversion | EPUB fixture rendered to a one-page PDF | Passed |
 | CI | GitHub Actions workflow structural checks | Passed |
 | Security | Production startup rejects missing/weak `JWT_SECRET`; demo routes require explicit development mode | Passed |
+| PDF reader | `flutter_pdfview` integration, local cache path, protected byte download, and Premium-only file route | Passed |
+| Persistence boundary | Optional MySQL adapter compiles, health metadata exposes DB state, and required-DB guard fails closed | Passed |
+| Production config | Demo auth/local storage are rejected in production unless explicitly overridden | Passed |
 
-The current demo billing verifier is intentionally limited to local development. Production must replace it with Apple App Store and Google Play server-side receipt verification and set `DEMO_MODE=false`.
+The current demo billing verifier is intentionally limited to local development. Production must replace it with Apple App Store Server API / Notifications V2 and Google Play subscription verification / RTDN handling, then set `DEMO_MODE=false`.

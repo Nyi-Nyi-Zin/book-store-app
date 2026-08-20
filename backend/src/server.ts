@@ -8,12 +8,25 @@ import path from 'node:path';
 import multer from 'multer';
 import { SignJWT, jwtVerify } from 'jose';
 import { z } from 'zod';
+import { databaseConfigured, databaseHealthy, persistAudit, persistBook, persistBookmark, persistEntitlement, persistProgress, persistUser } from './db.js';
 
 const app = express();
 const port = Number(process.env.PORT ?? 8787);
 const storageRoot = path.resolve(process.env.STORAGE_ROOT ?? './storage');
 const isProduction = process.env.NODE_ENV === 'production';
 const demoMode = !isProduction && process.env.DEMO_MODE === 'true';
+const databaseRequired = isProduction && process.env.DATABASE_REQUIRED === 'true';
+const storageProvider = process.env.STORAGE_PROVIDER ?? 'local';
+const authProvider = process.env.AUTH_PROVIDER ?? 'demo';
+if (isProduction && authProvider === 'demo') {
+  throw new Error('AUTH_PROVIDER must be configured for production');
+}
+if (isProduction && storageProvider === 'local' && process.env.ALLOW_LOCAL_STORAGE !== 'true') {
+  throw new Error('Local storage is disabled in production; configure protected object storage');
+}
+if (databaseRequired && !process.env.DATABASE_URL) {
+  throw new Error('DATABASE_URL is required when DATABASE_REQUIRED=true');
+}
 const allowedOrigins = new Set((process.env.CORS_ORIGINS ?? '').split(',').map((origin) => origin.trim()).filter(Boolean));
 if (isProduction && (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32)) {
   throw new Error('JWT_SECRET must be at least 32 characters in production');
@@ -90,6 +103,7 @@ function hasPremium(userId: number) {
 
 function recordAudit(adminUserId: number, action: string, entityType: string, entityId: string) {
   auditLogs.unshift({ id: `audit-${Date.now()}`, adminUserId, action, entityType, entityId, createdAt: new Date().toISOString() });
+  void persistAudit({ adminUserId, action, entityType, entityId });
 }
 
 function runEpubConversion(inputPath: string, outputPath: string): Promise<void> {
@@ -102,7 +116,7 @@ function runEpubConversion(inputPath: string, outputPath: string): Promise<void>
   });
 }
 
-app.get('/api/health', (_req, res) => res.json({ status: 'ok', service: 'book-app-api' }));
+app.get('/api/health', async (_req, res) => res.json({ status: 'ok', service: 'book-app-api', databaseConfigured: databaseConfigured(), databaseHealthy: await databaseHealthy(), storageProvider }));
 
 app.post('/api/auth/demo', async (req, res) => {
   if (!demoMode) return res.status(404).json({ error: 'Demo authentication is disabled' });
@@ -113,6 +127,7 @@ app.post('/api/auth/demo', async (req, res) => {
     user = { id: nextUserId++, openId, name: input.name, email: `${openId}@example.local`, role: input.role };
     users.set(openId, user);
   }
+  void persistUser(user);
   const token = await issueToken(user);
   res.json({ token, user });
 });
@@ -163,6 +178,7 @@ app.post('/api/premium/verify', auth, (req: AuthRequest, res) => {
   const expiresAt = new Date(Date.now() + durationDays * 24 * 60 * 60 * 1000).toISOString();
   const entitlement = { status: 'active' as const, expiresAt, platform: input.platform, productId: input.productId, transactionId: `demo-${Date.now()}` };
   entitlements.set(String(req.user!.id), entitlement);
+  void persistEntitlement({ userId: req.user!.id, platform: entitlement.platform, productId: entitlement.productId, transactionId: entitlement.transactionId, status: entitlement.status, expiresAt: entitlement.expiresAt });
   res.json({ ...entitlement, mode: 'demo' });
 });
 
@@ -173,6 +189,7 @@ app.get('/api/reader/progress/:bookId', auth, (req: AuthRequest, res) => {
 app.put('/api/reader/progress/:bookId', auth, (req: AuthRequest, res) => {
   const input = z.object({ pageNumber: z.number().int().min(1), percent: z.number().int().min(0).max(100) }).parse(req.body);
   progress.set(`${req.user!.id}:${req.params.bookId}`, input);
+  void persistProgress({ userId: req.user!.id, bookId: Number(req.params.bookId), ...input });
   res.json(input);
 });
 
@@ -189,6 +206,7 @@ app.post('/api/reader/bookmarks/:bookId', auth, (req: AuthRequest, res) => {
   const bookmark = { id: `bookmark-${Date.now()}`, pageNumber: input.pageNumber, note: input.note ?? null };
   items.push(bookmark);
   bookmarks.set(key, items);
+  void persistBookmark({ userId: req.user!.id, bookId: Number(req.params.bookId), pageNumber: bookmark.pageNumber, note: bookmark.note });
   res.status(201).json({ bookmark, created: true });
 });
 
@@ -203,6 +221,7 @@ app.post('/api/admin/books', auth, adminOnly, (req: AuthRequest, res) => {
   const input = z.object({ slug: z.string().regex(/^[a-z0-9-]+$/), titleMy: z.string().min(1), titleEn: z.string().min(1), author: z.string().min(1), description: z.string().optional() }).parse(req.body);
   const book = { id: nextBookId++, status: 'draft', hasPreview: false, pdfKey: null as string | null, epubKey: null as string | null, ...input, description: input.description ?? '' };
   books.push(book);
+  void persistBook(book);
   recordAudit(req.user!.id, 'book.created', 'book', String(book.id));
   res.status(201).json({ book });
 });
@@ -237,6 +256,7 @@ app.post('/api/admin/books/:id/upload', auth, adminOnly, upload.single('file'), 
       job.errorMessage = error instanceof Error ? error.message : 'Conversion failed';
     }
   })();
+  void persistBook(book);
   recordAudit(req.user!.id, isEpub ? 'book.epub_uploaded' : 'book.pdf_uploaded', 'book', String(book.id));
   return res.status(202).json({ book, job });
 });
@@ -247,6 +267,7 @@ app.post('/api/admin/books/:id/publish', auth, adminOnly, (req: AuthRequest, res
   if (!book.pdfKey) return res.status(409).json({ error: 'A converted PDF is required before publishing' });
   book.status = 'published';
   book.hasPreview = true;
+  void persistBook(book);
   recordAudit(req.user!.id, 'book.published', 'book', String(book.id));
   res.json({ book });
 });
@@ -255,6 +276,7 @@ app.post('/api/admin/books/:id/unpublish', auth, adminOnly, (req: AuthRequest, r
   const book = books.find((item) => item.id === Number(req.params.id));
   if (!book) return res.status(404).json({ error: 'Book not found' });
   book.status = 'draft';
+  void persistBook(book);
   recordAudit(req.user!.id, 'book.unpublished', 'book', String(book.id));
   res.json({ book });
 });
