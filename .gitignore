@@ -1,0 +1,34 @@
+# Flutter/Dart
+.dart_tool/
+.packages
+.pub-cache/
+.pub/
+build/
+coverage/
+.flutter-plugins
+.flutter-plugins-dependencies
+.metadata
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+backend/.env
+backend/storage/*
+backend/uploads/*
+
+# Node
+backend/node_modules/
+backend/dist/
+pnpm-debug.log*
+
+# Generated/local files
+*.log
+*.pdf
+*.epub
+.DS_Store
