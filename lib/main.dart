@@ -6,6 +6,7 @@ import 'package:flutter_pdfview/flutter_pdfview.dart';
 
 import 'api_client.dart';
 import 'premium_service.dart';
+import 'oidc_auth_service.dart';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -68,9 +69,17 @@ class AppState extends ChangeNotifier {
   final bookmarkIds = <String, Map<int, String>>{};
   final ApiClient api = ApiClient();
   final PremiumPurchaseService purchaseService = PremiumPurchaseService();
+  final OidcAuthService oidcAuth = OidcAuthService();
   List<ProductDetails> premiumProducts = [];
   String? userName, userEmail, sessionError;
   Map<String, dynamic>? subscription;
+  Map<String, bool> notificationPreferences = {
+    'newBooks': true,
+    'premiumExpiry': true,
+    'announcements': true,
+  };
+  Map<String, dynamic>? publicLegal;
+  bool notificationLoading = false;
   bool sessionLoading = false,
       purchaseLoading = false,
       accountActionLoading = false;
@@ -240,9 +249,51 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> _restoreSession() async {
-    // Tokens intentionally remain memory-only until a platform secure-storage
-    // implementation is selected for the target release configuration.
-    api.clearSession();
+    try {
+      await api.restoreToken();
+      if (!api.hasSession) return;
+      final body = await api.me();
+      final user = (body['user'] as Map?)?.cast<String, dynamic>();
+      isSignedIn = true;
+      isAdmin = user?['role'] == 'admin';
+      isPremium = body['isPremium'] == true;
+      userName = user?['name']?.toString();
+      userEmail = user?['email']?.toString();
+      await loadSubscription();
+      await loadNotificationPreferences();
+      await loadLegalLinks();
+      notifyListeners();
+    } catch (_) {
+      await api.clearSession();
+    }
+  }
+
+  Future<bool> loginWithOidc() async {
+    sessionLoading = true;
+    sessionError = null;
+    notifyListeners();
+    try {
+      final result = await oidcAuth.signIn();
+      await api.setToken(result.accessToken);
+      final body = await api.me();
+      final user = (body['user'] as Map?)?.cast<String, dynamic>();
+      isSignedIn = true;
+      isAdmin = user?['role'] == 'admin';
+      isPremium = body['isPremium'] == true;
+      userName = user?['name']?.toString();
+      userEmail = user?['email']?.toString();
+      subscription = body['entitlement'] is Map
+          ? {'isPremium': isPremium, 'entitlement': body['entitlement']}
+          : null;
+      return true;
+    } catch (error) {
+      sessionError = error.toString();
+      await api.clearSession();
+      return false;
+    } finally {
+      sessionLoading = false;
+      notifyListeners();
+    }
   }
 
   Future<bool> loginDemo({required bool admin}) async {
@@ -258,13 +309,15 @@ class AppState extends ChangeNotifier {
       if (token == null || token.isEmpty) {
         throw StateError('Missing session token');
       }
-      api.setToken(token);
+      await api.setToken(token);
       final user = (body['user'] as Map?)?.cast<String, dynamic>();
       isSignedIn = true;
       isAdmin = user?['role'] == 'admin';
       userName = user?['name']?.toString();
       userEmail = user?['email']?.toString();
       await loadSubscription();
+      await loadNotificationPreferences();
+      await loadLegalLinks();
       return true;
     } catch (error) {
       sessionError = error.toString();
@@ -285,6 +338,55 @@ class AppState extends ChangeNotifier {
     } catch (error) {
       sessionError = error.toString();
       notifyListeners();
+    }
+  }
+
+  Future<void> loadNotificationPreferences() async {
+    if (!isSignedIn || !api.hasSession) return;
+    try {
+      final body = await api.notificationPreferences();
+      final values = (body['preferences'] as Map?)?.cast<String, dynamic>();
+      if (values != null) {
+        notificationPreferences = values.map(
+          (key, value) => MapEntry(key, value == true),
+        );
+        notifyListeners();
+      }
+    } catch (error) {
+      sessionError = error.toString();
+      notifyListeners();
+    }
+  }
+
+  Future<void> setNotificationPreference(String key, bool value) async {
+    final previous = notificationPreferences[key] ?? true;
+    notificationPreferences = {...notificationPreferences, key: value};
+    notificationLoading = true;
+    notifyListeners();
+    try {
+      final body = await api.updateNotificationPreferences(
+        notificationPreferences,
+      );
+      final values = (body['preferences'] as Map?)?.cast<String, dynamic>();
+      if (values != null) {
+        notificationPreferences = values.map(
+          (name, enabled) => MapEntry(name, enabled == true),
+        );
+      }
+    } catch (error) {
+      notificationPreferences = {...notificationPreferences, key: previous};
+      sessionError = error.toString();
+    } finally {
+      notificationLoading = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> loadLegalLinks() async {
+    try {
+      publicLegal = await api.publicLegal();
+    } catch (_) {
+      publicLegal = null;
     }
   }
 
@@ -366,7 +468,7 @@ class AppState extends ChangeNotifier {
     subscription = null;
     sessionError = null;
     tabIndex = 0;
-    api.clearSession();
+    unawaited(api.clearSession());
     notifyListeners();
   }
 
@@ -1617,6 +1719,55 @@ class ProfilePage extends StatelessWidget {
               ),
             ),
           ),
+          Card(
+            child: Column(
+              children: [
+                ListTile(
+                  leading: const Icon(Icons.notifications_outlined),
+                  title: Text(
+                    t(state, 'အကြောင်းကြားချက်များ', 'Notifications'),
+                  ),
+                  subtitle: Text(
+                    t(
+                      state,
+                      'သင်လိုချင်သော အကြောင်းကြားချက်များကို ရွေးပါ။',
+                      'Choose which updates you receive.',
+                    ),
+                  ),
+                ),
+                SwitchListTile(
+                  title: Text(t(state, 'စာအုပ်အသစ်များ', 'New books')),
+                  value: state.notificationPreferences['newBooks'] ?? true,
+                  onChanged: state.notificationLoading
+                      ? null
+                      : (value) =>
+                            state.setNotificationPreference('newBooks', value),
+                ),
+                SwitchListTile(
+                  title: Text(
+                    t(state, 'Premium သက်တမ်းကုန်ဆုံးမှု', 'Premium expiry'),
+                  ),
+                  value: state.notificationPreferences['premiumExpiry'] ?? true,
+                  onChanged: state.notificationLoading
+                      ? null
+                      : (value) => state.setNotificationPreference(
+                          'premiumExpiry',
+                          value,
+                        ),
+                ),
+                SwitchListTile(
+                  title: Text(t(state, 'ကြေညာချက်များ', 'Announcements')),
+                  value: state.notificationPreferences['announcements'] ?? true,
+                  onChanged: state.notificationLoading
+                      ? null
+                      : (value) => state.setNotificationPreference(
+                          'announcements',
+                          value,
+                        ),
+                ),
+              ],
+            ),
+          ),
           ListTile(
             leading: Icon(
               Icons.delete_forever_outlined,
@@ -1720,11 +1871,7 @@ class ProfilePage extends StatelessWidget {
             builder: (_) => AlertDialog(
               title: Text(t(state, 'Terms နှင့် Privacy', 'Terms and privacy')),
               content: Text(
-                t(
-                  state,
-                  'စာအုပ်ပါအကြောင်းအရာများကို မူပိုင်ခွင့်နှင့် သတ်မှတ်ချက်များအတိုင်း အသုံးပြုရပါမည်။ Privacy policy နှင့် terms ကို production release မတိုင်မီ သင့် domain ဖြင့် အစားထိုးပါ။',
-                  'Use book content according to copyright and service terms. Replace this placeholder with your published privacy policy and terms before production release.',
-                ),
+                '${t(state, 'မူဝါဒနှင့် စည်းမျဉ်းများ', 'Policies and terms')}\n\n${state.publicLegal?['privacyUrl'] ?? t(state, 'Privacy URL မသတ်မှတ်ရသေးပါ', 'Privacy URL is not configured')}\n${state.publicLegal?['termsUrl'] ?? t(state, 'Terms URL မသတ်မှတ်ရသေးပါ', 'Terms URL is not configured')}',
               ),
               actions: [
                 TextButton(
@@ -1775,6 +1922,20 @@ class ProfilePage extends StatelessWidget {
       ),
     ),
     actions: [
+      if (state.oidcAuth.config.isConfigured)
+        FilledButton.icon(
+          onPressed: state.sessionLoading
+              ? null
+              : () async {
+                  final ok = await state.loginWithOidc();
+                  if (!context.mounted) return;
+                  if (ok) Navigator.pop(context);
+                },
+          icon: const Icon(Icons.verified_user_outlined),
+          label: Text(
+            t(state, 'Provider ဖြင့် ဝင်ရန်', 'Sign in with provider'),
+          ),
+        ),
       TextButton(
         onPressed: () => showDialog(
           context: context,

@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 
 class ApiClient {
@@ -12,13 +13,29 @@ class ApiClient {
           );
 
   final String baseUrl;
+  final FlutterSecureStorage _secureStorage = const FlutterSecureStorage();
+  static const _tokenKey = 'book_app_access_token';
   String? token;
 
   bool get hasSession => token != null && token!.isNotEmpty;
 
-  void setToken(String? value) => token = value;
+  Future<void> setToken(String? value) async {
+    token = value;
+    if (value == null || value.isEmpty) {
+      await _secureStorage.delete(key: _tokenKey);
+    } else {
+      await _secureStorage.write(key: _tokenKey, value: value);
+    }
+  }
 
-  void clearSession() => token = null;
+  Future<void> restoreToken() async {
+    token = await _secureStorage.read(key: _tokenKey);
+  }
+
+  Future<void> clearSession() async {
+    token = null;
+    await _secureStorage.delete(key: _tokenKey);
+  }
 
   Map<String, String> get _headers => {
     'Accept': 'application/json',
@@ -42,6 +59,22 @@ class ApiClient {
 
   Future<Map<String, dynamic>> subscriptionStatus() async =>
       _get('/api/account/subscription');
+
+  Future<Map<String, dynamic>> notificationPreferences() async =>
+      _get('/api/account/notification-preferences');
+
+  Future<Map<String, dynamic>> updateNotificationPreferences(
+    Map<String, bool> preferences,
+  ) async {
+    final response = await http.put(
+      Uri.parse('$baseUrl/api/account/notification-preferences'),
+      headers: _headers,
+      body: jsonEncode(preferences),
+    );
+    return _decode(response);
+  }
+
+  Future<Map<String, dynamic>> publicLegal() async => _get('/api/public/legal');
 
   Future<Map<String, dynamic>> requestAccountDeletion() async {
     final response = await http.post(

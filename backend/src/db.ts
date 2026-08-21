@@ -119,3 +119,111 @@ export async function persistAudit(input: { adminUserId: number; action: string;
     );
   });
 }
+
+export type PersistedUser = UserRecord;
+export type PersistedBook = BookRecord & { titleMy?: string; titleEn?: string; author?: string; description?: string; hasPreview?: boolean };
+export type PersistedEntitlement = { status: 'active' | 'expired' | 'revoked' | 'pending'; expiresAt: string | null; platform: 'ios' | 'android' | 'admin'; productId: string; transactionId: string };
+
+export async function readUserById(id: number): Promise<PersistedUser | null> {
+  const db = getPool();
+  if (!db) return null;
+  try {
+    const [rows] = await db.query('SELECT id, open_id AS openId, name, email, role FROM users WHERE id = ? LIMIT 1', [id]);
+    const row = (rows as Array<Record<string, unknown>>)[0];
+    if (!row) return null;
+    return { id: Number(row.id), openId: String(row.openId), name: String(row.name ?? ''), email: String(row.email ?? ''), role: row.role === 'admin' ? 'admin' : 'user' };
+  } catch (error) {
+    console.warn('[Database] user read failed; local fallback remains active:', error);
+    return null;
+  }
+}
+
+export async function readPublishedBooks(): Promise<PersistedBook[] | null> {
+  const db = getPool();
+  if (!db) return null;
+  try {
+    const [rows] = await db.query(`
+      SELECT b.id, b.slug, b.status, b.pdf_key AS pdfKey, b.epub_key AS epubKey,
+        MAX(CASE WHEN bt.language = 'my' THEN bt.title END) AS titleMy,
+        MAX(CASE WHEN bt.language = 'en' THEN bt.title END) AS titleEn,
+        MAX(CASE WHEN bt.language = 'en' THEN bt.author END) AS author,
+        MAX(CASE WHEN bt.language = 'en' THEN bt.description END) AS description
+      FROM books b LEFT JOIN book_translations bt ON bt.book_id = b.id
+      WHERE b.status = 'published'
+      GROUP BY b.id, b.slug, b.status, b.pdf_key, b.epub_key
+      ORDER BY b.id DESC
+    `);
+    return (rows as Array<Record<string, unknown>>).map((row) => ({
+      id: Number(row.id), slug: String(row.slug), status: String(row.status), pdfKey: row.pdfKey ? String(row.pdfKey) : null, epubKey: row.epubKey ? String(row.epubKey) : null,
+      titleMy: row.titleMy ? String(row.titleMy) : undefined, titleEn: row.titleEn ? String(row.titleEn) : undefined, author: row.author ? String(row.author) : undefined, description: row.description ? String(row.description) : undefined, hasPreview: true,
+    }));
+  } catch (error) {
+    console.warn('[Database] book read failed; local fallback remains active:', error);
+    return null;
+  }
+}
+
+export async function readEntitlement(userId: number): Promise<PersistedEntitlement | null> {
+  const db = getPool();
+  if (!db) return null;
+  try {
+    const [rows] = await db.query('SELECT status, expires_at AS expiresAt, platform, product_id AS productId, transaction_id AS transactionId FROM entitlements WHERE user_id = ? ORDER BY verified_at DESC, id DESC LIMIT 1', [userId]);
+    const row = (rows as Array<Record<string, unknown>>)[0];
+    if (!row) return null;
+    return { status: row.status as PersistedEntitlement['status'], expiresAt: row.expiresAt ? new Date(String(row.expiresAt)).toISOString() : null, platform: row.platform as PersistedEntitlement['platform'], productId: String(row.productId), transactionId: String(row.transactionId) };
+  } catch (error) {
+    console.warn('[Database] entitlement read failed; local fallback remains active:', error);
+    return null;
+  }
+}
+
+export async function readProgress(userId: number, bookId: number): Promise<{ pageNumber: number; percent: number } | null> {
+  const db = getPool();
+  if (!db) return null;
+  try {
+    const [rows] = await db.query('SELECT page_number AS pageNumber, percent FROM reading_progress WHERE user_id = ? AND book_id = ? LIMIT 1', [userId, bookId]);
+    const row = (rows as Array<Record<string, unknown>>)[0];
+    return row ? { pageNumber: Number(row.pageNumber), percent: Number(row.percent) } : null;
+  } catch (error) {
+    console.warn('[Database] progress read failed; local fallback remains active:', error);
+    return null;
+  }
+}
+
+export async function readBookmarks(userId: number, bookId: number): Promise<Array<{ id: string; pageNumber: number; note: string | null }> | null> {
+  const db = getPool();
+  if (!db) return null;
+  try {
+    const [rows] = await db.query('SELECT id, page_number AS pageNumber, note FROM bookmarks WHERE user_id = ? AND book_id = ? ORDER BY page_number', [userId, bookId]);
+    return (rows as Array<Record<string, unknown>>).map((row) => ({ id: String(row.id), pageNumber: Number(row.pageNumber), note: row.note ? String(row.note) : null }));
+  } catch (error) {
+    console.warn('[Database] bookmark read failed; local fallback remains active:', error);
+    return null;
+  }
+}
+
+export type NotificationPreferences = { newBooks: boolean; premiumExpiry: boolean; announcements: boolean };
+
+export async function persistNotificationPreferences(userId: number, input: NotificationPreferences): Promise<void> {
+  await safe('notification preference write', async (db) => {
+    await db.execute(
+      `INSERT INTO notification_preferences (user_id, new_books, premium_expiry, announcements)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE new_books = VALUES(new_books), premium_expiry = VALUES(premium_expiry), announcements = VALUES(announcements), updated_at = CURRENT_TIMESTAMP`,
+      [userId, input.newBooks ? 1 : 0, input.premiumExpiry ? 1 : 0, input.announcements ? 1 : 0],
+    );
+  });
+}
+
+export async function readNotificationPreferences(userId: number): Promise<NotificationPreferences | null> {
+  const db = getPool();
+  if (!db) return null;
+  try {
+    const [rows] = await db.query('SELECT new_books AS newBooks, premium_expiry AS premiumExpiry, announcements FROM notification_preferences WHERE user_id = ? LIMIT 1', [userId]);
+    const row = (rows as Array<Record<string, unknown>>)[0];
+    return row ? { newBooks: Boolean(row.newBooks), premiumExpiry: Boolean(row.premiumExpiry), announcements: Boolean(row.announcements) } : null;
+  } catch (error) {
+    console.warn('[Database] notification preference read failed; local fallback remains active:', error);
+    return null;
+  }
+}

@@ -2,13 +2,16 @@ import 'dotenv/config';
 
 import cors from 'cors';
 import express, { type NextFunction, type Request, type Response } from 'express';
+import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import multer from 'multer';
-import { SignJWT, jwtVerify } from 'jose';
+import { createRemoteJWKSet, SignJWT, jwtVerify, type JWTPayload } from 'jose';
 import { z } from 'zod';
-import { databaseConfigured, databaseHealthy, persistAudit, persistBook, persistBookmark, persistEntitlement, persistProgress, persistUser } from './db.js';
+import { databaseConfigured, databaseHealthy, persistAudit, persistBook, persistBookmark, persistEntitlement, persistProgress, persistUser, readBookmarks, readEntitlement, readNotificationPreferences, readPublishedBooks, readProgress, readUserById, persistNotificationPreferences } from './db.js';
+import { putObjectFromFile, signedDownloadUrl, storageConfigured } from './storage.js';
+import { parseGoogleNotification, verifyAppleNotification, verifyStorePurchase, type VerifiedEntitlement } from './billing.js';
 
 const app = express();
 const port = Number(process.env.PORT ?? 8787);
@@ -18,20 +21,30 @@ const demoMode = !isProduction && process.env.DEMO_MODE === 'true';
 const databaseRequired = isProduction && process.env.DATABASE_REQUIRED === 'true';
 const storageProvider = process.env.STORAGE_PROVIDER ?? 'local';
 const authProvider = process.env.AUTH_PROVIDER ?? 'demo';
+const oidcIssuer = process.env.OIDC_ISSUER_URL?.replace(/\/$/, '');
+const oidcAudience = process.env.OIDC_AUDIENCE;
 if (isProduction && authProvider === 'demo') {
   throw new Error('AUTH_PROVIDER must be configured for production');
 }
-if (isProduction && storageProvider === 'local' && process.env.ALLOW_LOCAL_STORAGE !== 'true') {
-  throw new Error('Local storage is disabled in production; configure protected object storage');
+if (isProduction && authProvider !== 'demo' && (!oidcIssuer || !oidcAudience)) {
+  throw new Error('OIDC_ISSUER_URL and OIDC_AUDIENCE are required for the configured production auth provider');
+}
+if (isProduction && (!storageConfigured() || (storageProvider === 'local' && process.env.ALLOW_LOCAL_STORAGE !== 'true'))) {
+  throw new Error('Protected object storage is not configured for production');
 }
 if (databaseRequired && !process.env.DATABASE_URL) {
   throw new Error('DATABASE_URL is required when DATABASE_REQUIRED=true');
 }
 const allowedOrigins = new Set((process.env.CORS_ORIGINS ?? '').split(',').map((origin) => origin.trim()).filter(Boolean));
+if (isProduction && allowedOrigins.size === 0) {
+  throw new Error('CORS_ORIGINS must list at least one trusted origin in production');
+}
 if (isProduction && (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32)) {
   throw new Error('JWT_SECRET must be at least 32 characters in production');
 }
 mkdirSync(storageRoot, { recursive: true });
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
 
 app.use(cors({
   credentials: true,
@@ -42,12 +55,51 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '2mb' }));
 
+const rateBuckets = new Map<string, { count: number; resetAt: number }>();
+function rateLimit(max: number, windowMs: number) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const now = Date.now();
+    const key = `${req.ip ?? 'unknown'}:${req.baseUrl || '/api'}`;
+    const current = rateBuckets.get(key);
+    if (!current || current.resetAt <= now) {
+      rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+    current.count += 1;
+    if (current.count > max) {
+      res.setHeader('Retry-After', Math.ceil((current.resetAt - now) / 1000));
+      return res.status(429).json({ error: 'Too many requests', requestId: res.getHeader('X-Request-Id') });
+    }
+    return next();
+  };
+}
+
+app.use((req, res, next) => {
+  const startedAt = Date.now();
+  res.setHeader('X-Request-Id', randomUUID());
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  res.on('finish', () => {
+    console.info(JSON.stringify({ event: 'http_request', requestId: res.getHeader('X-Request-Id'), method: req.method, path: req.path, status: res.statusCode, durationMs: Date.now() - startedAt }));
+  });
+  next();
+});
+const apiRateLimitMax = Number(process.env.API_RATE_LIMIT_MAX ?? (isProduction ? 120 : 600));
+const apiRateLimitWindowMs = Number(process.env.API_RATE_LIMIT_WINDOW_SECONDS ?? 60) * 1000;
+const authRateLimitMax = Number(process.env.AUTH_RATE_LIMIT_MAX ?? (isProduction ? 20 : 200));
+const authRateLimitWindowMs = Number(process.env.AUTH_RATE_LIMIT_WINDOW_SECONDS ?? 600) * 1000;
+app.use('/api', rateLimit(apiRateLimitMax, apiRateLimitWindowMs));
+app.use('/api/auth', rateLimit(authRateLimitMax, authRateLimitWindowMs));
+
 const users = new Map<string, { id: number; openId: string; name: string; email: string; role: 'user' | 'admin' }>();
-const entitlements = new Map<string, { status: 'active' | 'expired' | 'revoked'; expiresAt: string | null }>();
+const entitlements = new Map<string, { status: 'active' | 'expired' | 'revoked' | 'pending'; expiresAt: string | null; platform?: 'ios' | 'android' | 'admin'; productId?: string; transactionId?: string }>();
 const progress = new Map<string, { pageNumber: number; percent: number }>();
 const bookmarks = new Map<string, Array<{ id: string; pageNumber: number; note: string | null }>>();
 const auditLogs: Array<{ id: string; adminUserId: number; action: string; entityType: string; entityId: string; createdAt: string }> = [];
 const accountDeletionRequests: Array<{ id: string; userId: number; status: 'received'; createdAt: string }> = [];
+const notificationPreferences = new Map<number, { newBooks: boolean; premiumExpiry: boolean; announcements: boolean }>();
 const conversionJobs = new Map<string, ConversionJob>();
 let nextUserId = 1;
 let nextBookId = 4;
@@ -59,7 +111,9 @@ const books = [
 ];
 
 const secret = new TextEncoder().encode(process.env.JWT_SECRET ?? 'local-development-only-change-me');
+let oidcJwks: ReturnType<typeof createRemoteJWKSet> | null = null;
 const premiumProducts = new Set(['book_app_premium_monthly', 'book_app_premium_yearly']);
+const verifiedTransactions = new Map<string, { userId: number; entitlement: VerifiedEntitlement }>();
 const upload = multer({
   dest: storageRoot,
   limits: { fileSize: Number(process.env.MAX_UPLOAD_MB ?? 100) * 1024 * 1024 },
@@ -77,15 +131,59 @@ async function issueToken(user: { id: number; openId: string; name: string; emai
     .sign(secret);
 }
 
+function configuredAdminClaimMatches(payload: JWTPayload): boolean {
+  const claimName = process.env.OIDC_ADMIN_CLAIM ?? 'roles';
+  const allowed = new Set((process.env.OIDC_ADMIN_VALUES ?? 'admin').split(',').map((value) => value.trim()).filter(Boolean));
+  const claim = payload[claimName];
+  const values = Array.isArray(claim) ? claim.map(String) : typeof claim === 'string' ? [claim] : [];
+  return values.some((value) => allowed.has(value));
+}
+
+async function verifyOidcToken(token: string): Promise<JWTPayload> {
+  if (!oidcIssuer || !oidcAudience) throw new Error('OIDC provider is not configured');
+  if (!oidcJwks) {
+    const response = await fetch(`${oidcIssuer}/.well-known/openid-configuration`);
+    if (!response.ok) throw new Error(`OIDC discovery failed with status ${response.status}`);
+    const metadata = await response.json() as { issuer?: string; jwks_uri?: string };
+    if (metadata.issuer !== oidcIssuer || !metadata.jwks_uri) throw new Error('OIDC discovery metadata is invalid');
+    oidcJwks = createRemoteJWKSet(new URL(metadata.jwks_uri));
+  }
+  const { payload } = await jwtVerify(token, oidcJwks, { issuer: oidcIssuer, audience: oidcAudience, algorithms: ['RS256', 'ES256'] });
+  return payload;
+}
+
+async function userFromOidcPayload(payload: JWTPayload) {
+  if (typeof payload.sub !== 'string' || payload.sub.length === 0) throw new Error('OIDC token has no subject');
+  const openId = `oidc:${oidcIssuer}:${payload.sub}`;
+  const claims = payload as JWTPayload & { name?: unknown; email?: unknown };
+  const existing = users.get(openId);
+  const user = existing ?? {
+    id: nextUserId++,
+    openId,
+    name: typeof claims.name === 'string' && claims.name ? claims.name : 'Reader',
+    email: typeof claims.email === 'string' ? claims.email : `${payload.sub}@oidc.invalid`,
+    role: configuredAdminClaimMatches(payload) ? 'admin' as const : 'user' as const,
+  };
+  users.set(openId, user);
+  void persistUser(user);
+  return user;
+}
+
 async function auth(req: AuthRequest, res: Response, next: NextFunction) {
   const value = req.header('authorization');
   if (!value?.startsWith('Bearer ')) return res.status(401).json({ error: 'Authentication required' });
   try {
-    const { payload } = await jwtVerify(value.slice(7), secret);
-    const user = [...users.values()].find((candidate) => candidate.id === Number(payload.sub));
-    if (!user) return res.status(401).json({ error: 'Session user not found' });
+    const token = value.slice(7);
+    if (authProvider !== 'demo' && oidcIssuer) {
+      req.user = await userFromOidcPayload(await verifyOidcToken(token));
+      return next();
+    }
+    const { payload } = await jwtVerify(token, secret);
+    const persistedUser = await readUserById(Number(payload.sub));
+    const user = persistedUser ?? [...users.values()].find((candidate) => candidate.id === Number(payload.sub));
+    if (!user) return res.status(databaseRequired ? 503 : 401).json({ error: databaseRequired ? 'Persistent user store is unavailable' : 'Session user not found' });
     req.user = user;
-    next();
+    return next();
   } catch {
     return res.status(401).json({ error: 'Invalid or expired session' });
   }
@@ -102,9 +200,43 @@ function hasPremium(userId: number) {
   return !record.expiresAt || new Date(record.expiresAt).getTime() > Date.now();
 }
 
+async function hasPremiumAsync(userId: number) {
+  const persisted = await readEntitlement(userId);
+  if (persisted) {
+    entitlements.set(String(userId), persisted);
+    return persisted.status === 'active' && (!persisted.expiresAt || new Date(persisted.expiresAt).getTime() > Date.now());
+  }
+  return hasPremium(userId);
+}
+
+function asyncHandler(handler: (req: Request, res: Response, next: NextFunction) => Promise<unknown>) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    void handler(req, res, next).catch(next);
+  };
+}
+
+function findVerifiedPurchase(purchaseToken: string) {
+  return [...verifiedTransactions.values()].find((entry) => entry.entitlement.purchaseToken === purchaseToken);
+}
+
+function applyEntitlement(userId: number, entitlement: VerifiedEntitlement) {
+  const existing = verifiedTransactions.get(entitlement.transactionId);
+  if (existing && existing.userId !== userId) throw new Error('Transaction is already associated with another user');
+  verifiedTransactions.set(entitlement.transactionId, { userId, entitlement });
+  entitlements.set(String(userId), entitlement);
+  void persistEntitlement({ userId, platform: entitlement.platform, productId: entitlement.productId, transactionId: entitlement.transactionId, status: entitlement.status, expiresAt: entitlement.expiresAt });
+}
+
 function recordAudit(adminUserId: number, action: string, entityType: string, entityId: string) {
   auditLogs.unshift({ id: `audit-${Date.now()}`, adminUserId, action, entityType, entityId, createdAt: new Date().toISOString() });
   void persistAudit({ adminUserId, action, entityType, entityId });
+}
+
+async function findPublishedBook(bookId: number) {
+  const persisted = await readPublishedBooks();
+  if (persisted) return { book: persisted.find((item) => item.id === bookId), sourceAvailable: true };
+  if (databaseRequired) return { book: undefined, sourceAvailable: false };
+  return { book: books.find((item) => item.id === bookId), sourceAvailable: true };
 }
 
 function runEpubConversion(inputPath: string, outputPath: string): Promise<void> {
@@ -117,9 +249,16 @@ function runEpubConversion(inputPath: string, outputPath: string): Promise<void>
   });
 }
 
-app.get('/api/health', async (_req, res) => res.json({ status: 'ok', service: 'book-app-api', databaseConfigured: databaseConfigured(), databaseHealthy: await databaseHealthy(), storageProvider }));
+app.get('/api/health', asyncHandler(async (_req, res) => res.json({ status: 'ok', service: 'book-app-api', databaseConfigured: databaseConfigured(), databaseRequired, databaseHealthy: await databaseHealthy(), storageProvider, storageConfigured: storageConfigured() })));
 
-app.post('/api/auth/demo', async (req, res) => {
+app.get('/api/ready', asyncHandler(async (_req, res) => {
+  const databaseReady = !databaseRequired || (databaseConfigured() && await databaseHealthy());
+  const storageReady = !isProduction || storageConfigured();
+  const ready = databaseReady && storageReady;
+  res.status(ready ? 200 : 503).json({ ready, checks: { database: databaseReady, storage: storageReady } });
+}));
+
+app.post('/api/auth/demo', asyncHandler(async (req, res) => {
   if (!demoMode) return res.status(404).json({ error: 'Demo authentication is disabled' });
   const input = z.object({ role: z.enum(['user', 'admin']).default('user'), name: z.string().min(1).max(80).default('Demo Reader') }).parse(req.body ?? {});
   const openId = `demo-${input.role}`;
@@ -131,12 +270,12 @@ app.post('/api/auth/demo', async (req, res) => {
   void persistUser(user);
   const token = await issueToken(user);
   res.json({ token, user });
-});
+}));
 
-app.get('/api/auth/me', auth, (req: AuthRequest, res) => {
-  const isPremium = hasPremium(req.user!.id);
+app.get('/api/auth/me', auth, asyncHandler(async (req: AuthRequest, res) => {
+  const isPremium = await hasPremiumAsync(req.user!.id);
   res.json({ user: req.user, isPremium, entitlement: entitlements.get(String(req.user!.id)) ?? null });
-});
+}));
 
 app.post('/api/auth/signup', (req, res) => {
   const input = z.object({ name: z.string().min(1).max(80), email: z.string().email(), password: z.string().min(8) }).parse(req.body ?? {});
@@ -148,10 +287,11 @@ app.post('/api/auth/password-reset', (req, res) => {
   res.status(501).json({ error: 'Password reset is delegated to the configured authentication provider', provider: authProvider, email: input.email });
 });
 
-app.get('/api/account/subscription', auth, (req: AuthRequest, res) => {
+app.get('/api/account/subscription', auth, asyncHandler(async (req: AuthRequest, res) => {
+  const isPremium = await hasPremiumAsync(req.user!.id);
   const entitlement = entitlements.get(String(req.user!.id)) ?? null;
-  res.json({ isPremium: hasPremium(req.user!.id), entitlement });
-});
+  res.json({ isPremium, entitlement });
+}));
 
 app.post('/api/account/delete-request', auth, (req: AuthRequest, res) => {
   const request = { id: `delete-${Date.now()}`, userId: req.user!.id, status: 'received' as const, createdAt: new Date().toISOString() };
@@ -159,29 +299,60 @@ app.post('/api/account/delete-request', auth, (req: AuthRequest, res) => {
   res.status(202).json({ requestId: request.id, status: request.status, message: 'Account deletion request received' });
 });
 
-app.get('/api/books', (_req, res) => res.json({ books }));
+app.get('/api/account/notification-preferences', auth, asyncHandler(async (req: AuthRequest, res) => {
+  const persisted = await readNotificationPreferences(req.user!.id);
+  const preferences = persisted ?? notificationPreferences.get(req.user!.id) ?? { newBooks: true, premiumExpiry: true, announcements: true };
+  notificationPreferences.set(req.user!.id, preferences);
+  res.json({ preferences });
+}));
 
-app.get('/api/books/:id', (req, res) => {
-  const book = books.find((item) => item.id === Number(req.params.id));
-  if (!book || book.status !== 'published') return res.status(404).json({ error: 'Book not found' });
-  res.json({ book });
-});
+app.put('/api/account/notification-preferences', auth, asyncHandler(async (req: AuthRequest, res) => {
+  const current = notificationPreferences.get(req.user!.id) ?? { newBooks: true, premiumExpiry: true, announcements: true };
+  const input = z.object({ newBooks: z.boolean().optional(), premiumExpiry: z.boolean().optional(), announcements: z.boolean().optional() }).parse(req.body ?? {});
+  const preferences = { newBooks: input.newBooks ?? current.newBooks, premiumExpiry: input.premiumExpiry ?? current.premiumExpiry, announcements: input.announcements ?? current.announcements };
+  notificationPreferences.set(req.user!.id, preferences);
+  void persistNotificationPreferences(req.user!.id, preferences);
+  res.json({ preferences });
+}));
 
-app.get('/api/books/:id/access', auth, (req: AuthRequest, res) => {
-  const book = books.find((item) => item.id === Number(req.params.id));
+app.get('/api/public/legal', (_req, res) => res.json({ privacyUrl: process.env.PRIVACY_URL ?? null, termsUrl: process.env.TERMS_URL ?? null, supportEmail: process.env.SUPPORT_EMAIL ?? null, copyrightEmail: process.env.COPYRIGHT_EMAIL ?? null }));
+
+app.get('/api/books', asyncHandler(async (_req, res) => {
+  const persisted = await readPublishedBooks();
+  if (persisted) return res.json({ books: persisted });
+  if (databaseRequired) return res.status(503).json({ error: 'Persistent catalog is unavailable' });
+  return res.json({ books });
+}));
+
+app.get('/api/books/:id', asyncHandler(async (req, res) => {
+  const result = await findPublishedBook(Number(req.params.id));
+  if (!result.sourceAvailable) return res.status(503).json({ error: 'Persistent catalog is unavailable' });
+  if (!result.book || result.book.status !== 'published') return res.status(404).json({ error: 'Book not found' });
+  res.json({ book: result.book });
+}));
+
+app.get('/api/books/:id/access', auth, asyncHandler(async (req: AuthRequest, res) => {
+  const result = await findPublishedBook(Number(req.params.id));
+  if (!result.sourceAvailable) return res.status(503).json({ error: 'Persistent catalog is unavailable' });
+  const book = result.book;
   if (!book || book.status !== 'published') return res.status(404).json({ error: 'Book not found' });
-  const premium = hasPremium(req.user!.id) || req.user!.role === 'admin';
+  const premium = await hasPremiumAsync(req.user!.id) || req.user!.role === 'admin';
   if (!premium) return res.status(403).json({ error: 'Premium entitlement required', previewAvailable: book.hasPreview });
-  res.json({ access: 'full', bookId: book.id, fileUrl: `/api/books/${book.id}/file`, expiresInSeconds: 900 });
-});
+  const signedUrl = book.pdfKey ? await signedDownloadUrl(book.pdfKey, 900) : null;
+  res.json({ access: 'full', bookId: book.id, fileUrl: signedUrl ?? `/api/books/${book.id}/file`, expiresInSeconds: 900, storage: signedUrl ? 'signed-url' : 'local' });
+}));
 
-app.get('/api/books/:id/file', auth, (req: AuthRequest, res) => {
-  const premium = hasPremium(req.user!.id) || req.user!.role === 'admin';
+app.get('/api/books/:id/file', auth, asyncHandler(async (req: AuthRequest, res) => {
+  const premium = await hasPremiumAsync(req.user!.id) || req.user!.role === 'admin';
   if (!premium) return res.status(403).json({ error: 'Premium entitlement required' });
-  const book = books.find((item) => item.id === Number(req.params.id));
+  const result = await findPublishedBook(Number(req.params.id));
+  if (!result.sourceAvailable) return res.status(503).json({ error: 'Persistent catalog is unavailable' });
+  const book = result.book;
   if (!book?.pdfKey) return res.status(404).json({ error: 'PDF asset is not available yet' });
-  res.sendFile(book.pdfKey);
-});
+  const signedUrl = await signedDownloadUrl(book.pdfKey, 900);
+  if (signedUrl) return res.redirect(307, signedUrl);
+  return res.sendFile(book.pdfKey);
+}));
 
 app.post('/api/premium/demo-activate', auth, (req: AuthRequest, res) => {
   if (!demoMode) return res.status(404).json({ error: 'Demo Premium activation is disabled' });
@@ -190,23 +361,58 @@ app.post('/api/premium/demo-activate', auth, (req: AuthRequest, res) => {
   res.json({ status: 'active', expiresAt, mode: 'demo' });
 });
 
-app.post('/api/premium/verify', auth, (req: AuthRequest, res) => {
+app.post('/api/premium/verify', auth, asyncHandler(async (req: AuthRequest, res) => {
   const input = z.object({ platform: z.enum(['ios', 'android']), productId: z.string().min(1), purchaseToken: z.string().min(1) }).parse(req.body);
   if (!premiumProducts.has(input.productId)) return res.status(400).json({ error: 'Unknown Premium product' });
-  if (!demoMode || process.env.BILLING_VERIFY_MODE !== 'demo') {
-    return res.status(501).json({ error: 'Store verification is not configured', received: { platform: input.platform, productId: input.productId } });
+  if (demoMode && process.env.BILLING_VERIFY_MODE === 'demo') {
+    const durationDays = input.productId.endsWith('_yearly') ? 365 : 30;
+    const entitlement: VerifiedEntitlement = { status: 'active', expiresAt: new Date(Date.now() + durationDays * 24 * 60 * 60 * 1000).toISOString(), platform: input.platform, productId: input.productId, transactionId: `demo-${Date.now()}`, purchaseToken: input.purchaseToken, source: input.platform === 'ios' ? 'apple' : 'google' };
+    applyEntitlement(req.user!.id, entitlement);
+    return res.json({ ...entitlement, mode: 'demo' });
   }
-  const durationDays = input.productId.endsWith('_yearly') ? 365 : 30;
-  const expiresAt = new Date(Date.now() + durationDays * 24 * 60 * 60 * 1000).toISOString();
-  const entitlement = { status: 'active' as const, expiresAt, platform: input.platform, productId: input.productId, transactionId: `demo-${Date.now()}` };
-  entitlements.set(String(req.user!.id), entitlement);
-  void persistEntitlement({ userId: req.user!.id, platform: entitlement.platform, productId: entitlement.productId, transactionId: entitlement.transactionId, status: entitlement.status, expiresAt: entitlement.expiresAt });
-  res.json({ ...entitlement, mode: 'demo' });
-});
+  try {
+    const entitlement = await verifyStorePurchase(input);
+    applyEntitlement(req.user!.id, entitlement);
+    return res.json({ ...entitlement, mode: 'production' });
+  } catch (error) {
+    return res.status(502).json({ error: 'Store verification failed', detail: isProduction ? undefined : String(error) });
+  }
+}));
 
-app.get('/api/reader/progress/:bookId', auth, (req: AuthRequest, res) => {
-  res.json(progress.get(`${req.user!.id}:${req.params.bookId}`) ?? { pageNumber: 1, percent: 0 });
-});
+app.post('/api/webhooks/apple', asyncHandler(async (req, res) => {
+  const input = z.object({ signedPayload: z.string().min(1) }).parse(req.body ?? {});
+  const notification = await verifyAppleNotification(input.signedPayload);
+  const bundleId = process.env.APPLE_BUNDLE_ID;
+  if (bundleId && notification.transaction.bundleId !== bundleId) return res.status(400).json({ error: 'Apple notification bundle mismatch' });
+  const transactionId = notification.transaction.transactionId ? String(notification.transaction.transactionId) : null;
+  const existing = transactionId ? verifiedTransactions.get(transactionId) : undefined;
+  if (existing) {
+    const type = notification.notificationType ?? '';
+    const status = type.includes('REVOKE') || type.includes('REFUND') ? 'revoked' : type.includes('EXPIRED') ? 'expired' : existing.entitlement.status;
+    applyEntitlement(existing.userId, { ...existing.entitlement, status, expiresAt: notification.transaction.expiresDate ? new Date(Number(notification.transaction.expiresDate)).toISOString() : existing.entitlement.expiresAt });
+  }
+  res.json({ received: true, applied: Boolean(existing) });
+}));
+
+app.post('/api/webhooks/google', asyncHandler(async (req, res) => {
+  const expected = process.env.GOOGLE_PUBSUB_VERIFICATION_TOKEN;
+  if (expected && req.header('x-google-pubsub-token') !== expected) return res.status(401).json({ error: 'Invalid webhook token' });
+  const input = z.object({ message: z.object({ data: z.string().min(1) }) }).parse(req.body ?? {});
+  const payload = JSON.parse(Buffer.from(input.message.data, 'base64').toString('utf8')) as { subscriptionNotification?: { purchaseToken?: string; subscriptionId?: string } };
+  const notification = parseGoogleNotification(payload);
+  if (!notification.purchaseToken || !notification.productId) return res.json({ received: true, applied: false });
+  const existing = findVerifiedPurchase(notification.purchaseToken);
+  if (!existing) return res.status(202).json({ received: true, applied: false, reason: 'Purchase must be verified through the client flow first' });
+  const entitlement = await verifyStorePurchase({ platform: 'android', productId: notification.productId, purchaseToken: notification.purchaseToken });
+  applyEntitlement(existing.userId, entitlement);
+  res.json({ received: true, applied: true });
+}));
+
+app.get('/api/reader/progress/:bookId', auth, asyncHandler(async (req: AuthRequest, res) => {
+  const persisted = await readProgress(req.user!.id, Number(req.params.bookId));
+  const value = persisted ?? progress.get(`${req.user!.id}:${req.params.bookId}`) ?? { pageNumber: 1, percent: 0 };
+  res.json(value);
+}));
 
 app.put('/api/reader/progress/:bookId', auth, (req: AuthRequest, res) => {
   const input = z.object({ pageNumber: z.number().int().min(1), percent: z.number().int().min(0).max(100) }).parse(req.body);
@@ -215,9 +421,10 @@ app.put('/api/reader/progress/:bookId', auth, (req: AuthRequest, res) => {
   res.json(input);
 });
 
-app.get('/api/reader/bookmarks/:bookId', auth, (req: AuthRequest, res) => {
-  res.json({ bookmarks: bookmarks.get(`${req.user!.id}:${req.params.bookId}`) ?? [] });
-});
+app.get('/api/reader/bookmarks/:bookId', auth, asyncHandler(async (req: AuthRequest, res) => {
+  const persisted = await readBookmarks(req.user!.id, Number(req.params.bookId));
+  res.json({ bookmarks: persisted ?? bookmarks.get(`${req.user!.id}:${req.params.bookId}`) ?? [] });
+}));
 
 app.post('/api/reader/bookmarks/:bookId', auth, (req: AuthRequest, res) => {
   const input = z.object({ pageNumber: z.number().int().min(1), note: z.string().max(500).nullable().optional() }).parse(req.body);
@@ -248,20 +455,23 @@ app.post('/api/admin/books', auth, adminOnly, (req: AuthRequest, res) => {
   res.status(201).json({ book });
 });
 
-app.post('/api/admin/books/:id/upload', auth, adminOnly, upload.single('file'), (req: AuthRequest, res) => {
+app.post('/api/admin/books/:id/upload', auth, adminOnly, upload.single('file'), asyncHandler(async (req: AuthRequest, res) => {
   if (!req.file) return res.status(400).json({ error: 'file is required' });
   const book = books.find((item) => item.id === Number(req.params.id));
   if (!book) return res.status(404).json({ error: 'Book not found' });
   const isEpub = req.file.originalname.toLowerCase().endsWith('.epub');
   book.status = isEpub ? 'processing' : 'draft';
   if (!isEpub) {
-    book.pdfKey = req.file.path;
-    const job: ConversionJob = { id: `job-${Date.now()}`, bookId: book.id, sourceFilename: req.file.originalname, outputKey: req.file.path, status: 'completed' };
+    const objectKey = `books/${book.id}/${Date.now()}-${req.file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+    book.pdfKey = await putObjectFromFile({ key: objectKey, localPath: req.file.path, contentType: 'application/pdf' });
+    const job: ConversionJob = { id: `job-${Date.now()}`, bookId: book.id, sourceFilename: req.file.originalname, outputKey: book.pdfKey, status: 'completed' };
     conversionJobs.set(job.id, job);
+    void persistBook(book);
+    recordAudit(req.user!.id, 'book.pdf_uploaded', 'book', String(book.id));
     return res.status(202).json({ book, job });
   }
 
-  book.epubKey = req.file.path;
+  book.epubKey = await putObjectFromFile({ key: `books/${book.id}/${Date.now()}-${req.file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`, localPath: req.file.path, contentType: 'application/epub+zip' });
   const outputPath = path.join(storageRoot, `${book.id}-${Date.now()}.pdf`);
   const job: ConversionJob = { id: `job-${Date.now()}`, bookId: book.id, sourceFilename: req.file.originalname, outputKey: outputPath, status: 'queued' };
   conversionJobs.set(job.id, job);
@@ -269,8 +479,9 @@ app.post('/api/admin/books/:id/upload', auth, adminOnly, upload.single('file'), 
     job.status = 'processing';
     try {
       await runEpubConversion(req.file!.path, outputPath);
-      book.pdfKey = outputPath;
+      book.pdfKey = await putObjectFromFile({ key: `books/${book.id}/${Date.now()}-converted.pdf`, localPath: outputPath, contentType: 'application/pdf' });
       book.status = 'draft';
+      job.outputKey = book.pdfKey;
       job.status = 'completed';
     } catch (error) {
       book.status = 'draft';
@@ -281,7 +492,7 @@ app.post('/api/admin/books/:id/upload', auth, adminOnly, upload.single('file'), 
   void persistBook(book);
   recordAudit(req.user!.id, isEpub ? 'book.epub_uploaded' : 'book.pdf_uploaded', 'book', String(book.id));
   return res.status(202).json({ book, job });
-});
+}));
 
 app.post('/api/admin/books/:id/publish', auth, adminOnly, (req: AuthRequest, res) => {
   const book = books.find((item) => item.id === Number(req.params.id));
@@ -307,9 +518,10 @@ app.get('/api/admin/jobs', auth, adminOnly, (_req, res) => res.json({ jobs: [...
 app.get('/api/admin/audit', auth, adminOnly, (_req, res) => res.json({ logs: auditLogs }));
 
 app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
-  if (error instanceof z.ZodError) return res.status(400).json({ error: 'Invalid request', details: error.issues });
-  console.error(error);
-  res.status(500).json({ error: 'Internal server error' });
+  const requestId = res.getHeader('X-Request-Id');
+  if (error instanceof z.ZodError) return res.status(400).json({ error: 'Invalid request', details: error.issues, requestId });
+  console.error(`[${String(requestId)}]`, error);
+  res.status(500).json({ error: 'Internal server error', requestId });
 });
 
 app.listen(port, () => console.log(`Book App API listening on http://localhost:${port}`));
