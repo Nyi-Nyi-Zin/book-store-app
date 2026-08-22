@@ -2,7 +2,7 @@
 
 The backend now supports a generic **OpenID Connect (OIDC)** resource-server contract. In production, the API validates provider-issued bearer tokens using the provider's discovery metadata, issuer, audience, and JWKS signing keys. It does not trust a mobile-provided role flag. Admin access is derived from a configured signed-token claim and allowlisted values.
 
-OpenID Connect defines the issuer, subject, audience, and expiration claims used to validate identity assertions, while Discovery publishes the provider metadata and `jwks_uri` used to validate signatures.[1] [2]
+OpenID Connect defines the issuer, subject, audience, and expiration claims used to validate identity assertions, while Discovery publishes the provider metadata and `jwks_uri` used to validate signatures.[1] [2] For the first production deployment, use Auth0 as the provider profile: configure an Auth0 API audience for the Book App backend, a native Android/iOS application for AppAuth, and a namespaced custom admin-role claim added by a server-side Auth0 Action. The backend must validate issuer, audience, signature, expiry, and the configured role claim; it must never trust a role sent by the mobile client.
 
 | Variable | Purpose |
 |---|---|

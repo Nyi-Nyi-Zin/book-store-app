@@ -10,7 +10,7 @@ Create `backend/.env.production` from `.env.example` without committing it. Set 
 
 ## 3. Database migration
 
-Apply `backend/src/schema.sql` to the empty database before starting the API. The schema includes users, books, bilingual translations, conversion jobs, entitlements, reading progress, bookmarks, notification preferences, and audit logs. In a staging database, exercise the full upload, conversion, publish, Premium verification, reader, and account-deletion workflows before production.
+Apply the schema to the empty database before starting the API. From `backend/`, run `DATABASE_URL='mysql://...' pnpm run db:migrate`; the script reads `src/schema.sql` and applies it through the MySQL protocol, which is also the TiDB connection protocol. The schema includes users, books, bilingual translations, conversion jobs, entitlements, reading progress, bookmarks, notification preferences, and audit logs. In a staging database, exercise the full upload, conversion, publish, Premium verification, reader, and account-deletion workflows before production.
 
 ## 4. Container startup
 
