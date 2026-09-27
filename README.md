@@ -6,7 +6,7 @@ A cross-platform Flutter reading app for iOS and Android with Myanmar/English lo
 
 The Flutter client includes the home experience, bilingual catalog, search, book detail pages, sample reader, Premium screen, profile settings, theme/language switching, admin upload UI, conversion-job status UI, and local reading-progress state. The backend includes JWT-based session handling, user/admin role checks, catalog routes, protected full-book access, entitlement routes, reading-progress routes, admin book creation, multipart upload, and an asynchronous EPUB-to-PDF worker using Python, BeautifulSoup, and WeasyPrint.
 
-The client currently contains a local demo mode so the UI can be explored without external credentials. `lib/api_client.dart` and `lib/premium_service.dart` provide the production integration boundary for the backend API and App Store/Google Play billing. Real Apple/Google receipt verification, persistent database wiring, object-storage credentials, and store product configuration must be supplied before production release.
+The client currently contains a local demo mode so the UI can be explored without external credentials. `lib/api_client.dart` and `lib/premium_service.dart` provide the production integration boundary for the backend API and App Store/Google Play billing. The backend has an S3-compatible object-storage adapter that can connect to Cloudflare R2. Production still requires R2 bucket credentials, store configuration, and configured production identity/database services.
 
 ## Repository layout
 
@@ -66,13 +66,17 @@ The default API URL is `http://localhost:8787`. Useful endpoints include:
 
 ## Database and storage
 
-The repository contains `backend/src/schema.sql` for MySQL provisioning and `backend/src/schema.ts` for Drizzle model alignment. The current local smoke server uses an in-memory fallback to make the demo runnable without credentials. Production must connect the queries to the configured MySQL/TiDB database and move book assets from local disk to protected object storage with expiring signed URLs.
+The repository contains `backend/src/schema.sql` for MySQL provisioning and `backend/src/schema.ts` for Drizzle model alignment. The local demo can run without production credentials. Production uses a MySQL-compatible database and a **private Cloudflare R2 bucket** for EPUB/PDF files, covers, and previews.
 
-Do not commit `.env`, private keys, App Store service-account files, real book files, or store credentials. Use `.env.example` as the configuration template.
+The backend reads the R2 S3-compatible endpoint and credentials from environment variables. Start from `backend/.env.example`: set `STORAGE_BUCKET`, `STORAGE_ENDPOINT=https://YOUR_ACCOUNT_ID.r2.cloudflarestorage.com`, `STORAGE_REGION=auto`, `STORAGE_ACCESS_KEY_ID`, and `STORAGE_SECRET_ACCESS_KEY`. Create a bucket-scoped R2 API token and keep its credentials on the backend only. The backend checks Premium/admin access before it issues a short-lived presigned download URL. Keep the R2 bucket private.
+
+R2 currently includes 10 GB-month of Standard storage, 1 million Class A requests, and 10 million Class B requests per month at no charge; internet egress is free. Usage beyond the free allowance is billed. See [Cloudflare R2 pricing](https://developers.cloudflare.com/r2/pricing/) for current limits.
+
+Do not commit `.env`, private keys, App Store service-account files, real book files, or store credentials.
 
 ## Premium configuration
 
-Configure matching monthly/yearly products in App Store Connect and Google Play Console using the IDs in `lib/premium_service.dart`. The client sends purchase data to `/api/premium/verify`; the backend must verify Apple and Google receipts server-side before creating an active entitlement. The demo activation endpoint is for local testing only and must be disabled or protected from production use.
+Configure matching monthly/yearly products in App Store Connect and Google Play Console using the IDs in `lib/premium_service.dart`. An active Premium subscription grants access to all published books. The client sends purchase data to `/api/premium/verify`; the backend must verify Apple and Google purchases server-side before creating an active entitlement. The demo activation endpoint is for local testing only and must be disabled or protected from production use.
 
 ## EPUB conversion
 
@@ -93,10 +97,11 @@ The sandbox does not include the Android SDK or Xcode, so Android release builds
 
 ## Before production release
 
-Replace demo authentication with the selected OAuth/email authentication provider. Connect the database and protected object storage. Implement Apple App Store and Google Play receipt verification. Configure privacy policy, terms of use, account deletion, copyright contact, app identifiers, signing certificates, store products, and real licensed book content. Then test on physical iOS and Android devices using TestFlight and Google Play internal testing.
+Replace demo authentication with the selected OAuth/email authentication provider. Connect the production database and configure the private R2 bucket with backend-only credentials. Implement and verify Apple App Store and Google Play purchase handling. Configure privacy policy, terms of use, account deletion, copyright contact, app identifiers, signing certificates, store products, and real licensed book content. Then test on physical iOS and Android devices using TestFlight and Google Play internal testing.
 
 ## Official references
 
 - [Apple In-App Purchase](https://developer.apple.com/in-app-purchase/)
 - [Google Play Billing subscriptions](https://developer.android.com/google/play/billing/subscriptions)
 - [Flutter in_app_purchase](https://pub.dev/packages/in_app_purchase)
+- [Cloudflare R2 pricing](https://developers.cloudflare.com/r2/pricing/)
