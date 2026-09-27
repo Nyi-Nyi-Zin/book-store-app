@@ -4,7 +4,7 @@
 
 OpenID Connect (OIDC) is an identity layer built on top of OAuth 2.0. It lets the Flutter app send the user through a trusted Identity Provider (IdP), receive signed tokens, and let the backend verify the user identity without storing the user's password. The standard is designed for web, native mobile, and JavaScript clients and uses standard claims such as `sub`, `email`, and `name`.[1]
 
-In this application, OIDC handles **who the user is**. It does not decide whether the user can read a Premium book. The backend still performs authorization: it verifies the bearer token, maps the provider subject to an internal user, checks the user's role, checks the Premium entitlement, and then permits or denies the protected PDF download. The Flutter client uses AppAuth authorization-code flow with PKCE-ready configuration; the backend validates the issuer, audience, expiry, signature, and JWKS key set.
+In this application, OIDC handles **who the user is**. It does not decide whether the user can read a Premium book. The backend still performs authorization: it verifies the bearer token, maps the provider subject to an internal user, checks the user's role, checks the Premium entitlement, and then permits or denies the protected book download. The Flutter client uses AppAuth authorization-code flow with PKCE-ready configuration; the backend validates the issuer, audience, expiry, signature, and JWKS key set.
 
 ## Recommended production stack
 
@@ -12,13 +12,17 @@ In this application, OIDC handles **who the user is**. It does not decide whethe
 |---|---|---|
 | Authentication | Auth0 as the OIDC provider | Fits the generic OIDC discovery/JWKS verifier already implemented, supports native-app login and custom claims for the admin role, and avoids handling passwords in this API |
 | Application database | TiDB Cloud Serverless or TiDB Cloud Dedicated | MySQL-compatible, so the existing MySQL driver, SQL schema, `ON DUPLICATE KEY UPDATE` writes, and persistence adapter can remain in place; TiDB documents compatibility with common MySQL 5.7/8.0 protocol and syntax.[2] |
-| Book/file storage | Private S3-compatible bucket, preferably Cloudflare R2 or AWS S3 | Keeps EPUB/PDF bytes out of the database and supports short-lived signed download URLs |
+| Book/file storage | Cloudflare R2 with a private bucket | Stores EPUB/PDF files outside the database, works through the existing S3-compatible storage adapter, and has no internet egress charge; usage-based storage and request limits still apply.[4] |
 | Backend | Node.js API container with Python WeasyPrint conversion runtime | Matches the existing TypeScript API and supports Burmese-capable EPUB-to-PDF conversion |
 | Mobile | Flutter Android/iOS with AppAuth, secure storage, native PDF viewer, and in-app purchase | Preserves the current cross-platform implementation |
 
+## Premium access model
+
+An active Premium subscription grants access to all published books in the catalog. Store purchase validation and entitlement state are verified server-side. The backend checks the current entitlement before returning a short-lived R2 presigned download URL. The R2 bucket remains private; credentials are only configured on the backend and never shipped in the Flutter app.
+
 ## Why not migrate to Supabase for this version
 
-Supabase combines Postgres, Auth, REST APIs, and Storage in one platform and is a valid alternative.[3] However, the current Book App already has a MySQL/TiDB schema, MySQL connection adapter, SQL migrations, and S3-compatible storage boundary. Moving to Supabase would require a database dialect migration, PostgreSQL-specific authorization policies, a different storage integration, and a different authentication/session integration. That is a larger risk than configuring a standards-based OIDC provider and a MySQL-compatible production database.
+Supabase combines Postgres, Auth, REST APIs, and Storage in one platform and is a valid alternative.[3] However, the current Book App already has a MySQL/TiDB schema, MySQL connection adapter, SQL migrations, and an S3-compatible storage boundary. Moving to Supabase would require a database dialect migration, PostgreSQL-specific authorization policies, a different storage integration, and a different authentication/session integration. That is a larger risk than configuring a standards-based OIDC provider and a MySQL-compatible production database.
 
 ## Production identity flow
 
@@ -30,10 +34,11 @@ Create the MySQL-compatible database, apply `backend/src/schema.sql`, set `DATAB
 
 ## Decision
 
-Use **Auth0 OIDC + TiDB Cloud + private S3-compatible storage** for the first production deployment. Keep all provider details in environment variables and keep the API's provider-neutral interfaces so Auth0, another OIDC provider, or a self-hosted provider can be substituted later without changing Premium authorization or book storage logic.
+Use **Auth0 OIDC + TiDB Cloud + private Cloudflare R2 storage** for the first production deployment. Keep all provider details in environment variables and keep the API's provider-neutral interfaces so Auth0, another OIDC provider, or a self-hosted provider can be substituted later without changing Premium authorization or book storage logic.
 
 ## References
 
 [1]: https://openid.net/developers/how-connect-works/ "OpenID Foundation: How OpenID Connect Works"
 [2]: https://docs.pingcap.com/tidbcloud/mysql-compatibility/ "TiDB Cloud: MySQL Compatibility"
 [3]: https://supabase.com/docs/guides/auth "Supabase: Auth"
+[4]: https://developers.cloudflare.com/r2/pricing/ "Cloudflare R2: Pricing"
